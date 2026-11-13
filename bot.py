@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import sqlite3
@@ -25,11 +24,10 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
-# Память для навигации цифрами и ввода своего фокуса
-USER_MENU_STATE = {}          # user_id -> {"1": ("action", "value"), ...}
-AWAITING_CUSTOM_GOAL = set()  # user_id пользователей, вводящих свой фокус текстом
+# Пользователи, которые сейчас вводят собственный фокус текстом
+AWAITING_CUSTOM_GOAL = set()
 
-# --- КОРОТКИЕ СПРАВОЧНИКИ (защита от лимита 64 байта в callback_data) ---
+# --- СПРАВОЧНИКИ (короткие коды для callback_data) ---
 STAGE_MAP = {
     "1": "Планирую открыть дело",
     "2": "Действующий микробизнес",
@@ -52,23 +50,56 @@ GOAL_MAP = {
     "5": "Систематизация и найм команды"
 }
 
-# --- БАЗА ЗНАНИЙ «АЛЬФА-КУРСА» (с подробными материалами по ИП) ---
-DEFAULT_CATALOG = [
+# Справочник напоминаний по конкретным налогам
+SPECIFIC_TAX_REMINDERS = {
+    "usn": {
+        "name": "УСН (авансы и годовой налог)",
+        "regime": "УСН (Упрощенная система)",
+        "schedule_info": "Уведомление — до 25 числа, уплата квартальных авансов — до 28 апреля, 28 июля, 28 октября. Годовой налог — до 28 апреля.",
+        "reminder_title": "Уплата налога по УСН (уведомление до 25-го, платеж до 28-го числа)"
+    },
+    "npd": {
+        "name": "НПД (Налог на профдоход)",
+        "regime": "НПД (Самозанятый)",
+        "schedule_info": "Квитанция формируется в «Мой налог» до 12 числа, уплата налога — ежемесячно до 28 числа.",
+        "reminder_title": "Уплата налога НПД в приложении «Мой налог» (до 28 числа)"
+    },
+    "psn": {
+        "name": "Патент (ПСН)",
+        "regime": "Патент (ПСН)",
+        "schedule_info": "Патент до 6 мес. оплачивается целиком до конца срока. От 6 до 12 мес.: 1/3 — в первые 90 дней, 2/3 — до конца действия патента.",
+        "reminder_title": "Контроль оплаты Патента (ПСН) и подачи уведомления на уменьшение"
+    },
+    "vznosy": {
+        "name": "Страховые взносы ИП за себя",
+        "regime": None,
+        "schedule_info": "Фиксированные взносы ИП — до 28 декабря текущего года. Дополнительный взнос 1% с дохода свыше 300 000 ₽ — до 1 июля следующего года.",
+        "reminder_title": "Уплата страховых взносов ИП (до 28 декабря / 1% до 1 июля)"
+    },
+    "ausn": {
+        "name": "АУСН (Автоматизированная УСН)",
+        "regime": "АУСН",
+        "schedule_info": "ФНС рассчитывает налог автоматически до 15 числа, уплата — ежемесячно до 25 числа.",
+        "reminder_title": "Ежемесячная уплата налога по АУСН (до 25 числа)"
+    }
+}
+
+# --- БАЗА ЗНАНИЙ «АЛЬФА-КУРСА» ---
+CATALOG = [
     {
         "id": "mat_ip_start",
         "title": "Пошаговый гид: Как открыть ИП с нуля и без госпошлины",
         "category": "Регистрация и ИП",
-        "keywords": ["ип", "открыть", "регистрация", "оквэд", "с нуля", "документы", "старт"],
+        "keywords": ["ип", "открыть", "регистрация", "оквэд", "с нуля", "документы", "старт", "госпошлина"],
         "target_stage": "Планирую открыть дело",
         "is_paid": False,
-        "summary": "Полная инструкция по регистрации ИП за 3 дня: подбор кодов ОКВЭД, заявление Р21001, подача онлайн без уплаты госпошлины 800 ₽ и открытие счета.",
+        "summary": "Краткий план регистрации ИП за 0 ₽ и 3 рабочих дня с готовыми шаблонами документов.",
         "full_text": (
-            "📌 **Как открыть ИП с нуля за 5 шагов (по материалам «Альфа-Курса»):**\n"
-            "1. **Выберите коды ОКВЭД:** 1 основной код (от него зависит тариф взносов) и дополнительные (от 4 цифр в коде).\n"
-            "2. **Определитесь с налоговым режимом заранее:** подать уведомление о переходе на УСН нужно сразу при регистрации или в течение 30 дней, иначе по умолчанию включится сложная ОСНО.\n"
-            "3. **Подготовьте документы:** паспорт РФ, ИНН и заявление по форме № Р21001.\n"
-            "4. **Подайте заявку онлайн за 0 ₽:** через сервис регистрации бизнеса в Альфа-Банке, Госуслуги или сайт ФНС с КЭП госпошлина (800 ₽) не платится.\n"
-            "5. **Откройте расчетный счет и получите лист записи ЕГРИП:** документы придут на email через 1–3 рабочих дня."
+            "📌 **Как открыть ИП с нуля и без госпошлины — коротко о главном:**\n\n"
+            "• **Подберите ОКВЭД и налоговый режим:** выберите коды деятельности и сразу подайте уведомление на УСН или НПД, чтобы не остаться на сложной ОСНО.\n"
+            "• **Подайте заявку онлайн за 0 ₽:** при электронной подаче паспорта и ИНН (через сервис Альфа-Банка, Госуслуги или ФНС) госпошлина 800 ₽ не платится.\n"
+            "• **Получите документы и откройте счет:** лист записи ЕГРИП придет на почту за 1–3 дня, после чего можно сразу принимать оплату.\n\n"
+            "💡 *Все подробности, разбор частых ошибок при выборе ОКВЭД и готовые шаблоны заявлений смотрите в полном материале по ссылке на «Альфа-Курсе» ниже.*"
         ),
         "url": "https://kurs.alfabank.ru/catalog?type=courses&utm_source=tg_bot&utm_medium=ip_guide"
     },
@@ -79,14 +110,15 @@ DEFAULT_CATALOG = [
         "keywords": ["ип", "налог", "налоги", "усн", "патент", "псн", "аусн", "нпд", "режим", "ооо"],
         "target_stage": "Планирую открыть дело",
         "is_paid": False,
-        "summary": "Пошаговое сравнение НПД, УСН (Доходы 6% и Доходы минус расходы 15%), АУСН и Патента для ИП. Чек-лист перехода и лимиты.",
+        "summary": "Сравнение УСН, НПД, Патента и АУСН с возможностью сразу настроить напоминание по выбранному налогу.",
         "full_text": (
-            "📊 **Налоговые режимы для ИП (база «Альфа-Курса»):**\n"
-            "• **ИП на НПД:** 4% с физлиц и 6% с юрлиц/ИП. Лимит дохода — 2,4 млн ₽ в год, нельзя нанимать сотрудников по трудовым договорам, нет обязательных фиксированных взносов.\n"
-            "• **УСН «Доходы» (6%):** идеален для услуг и ИП с небольшими расходами. Налог можно уменьшать на сумму страховых взносов ИП (до 100% без сотрудников и до 50% с сотрудниками).\n"
-            "• **УСН «Доходы минус расходы» (15%):** выгоден для торговли и производства, если подтвержденные расходы составляют более 60–70% от выручки.\n"
-            "• **Патент (ПСН):** фиксированная стоимость налога для розницы, общепита и услуг (до 60 млн ₽ в год и до 15 сотрудников).\n"
-            "• **АУСН (8% или 20%):** банк и налоговая сами считают налог по операциям по счету, нет декларации и страховых взносов (при лимите до 60 млн ₽ и до 5 сотрудников)."
+            "📊 **Основные налоговые режимы для бизнеса:**\n\n"
+            "• **НПД (4–6%):** до 2,4 млн ₽ в год, без сотрудников и без обязательных взносов. Уплата — до 28 числа.\n"
+            "• **УСН «Доходы» (6%):** для услуг и небольших расходов. Уменьшается на взносы ИП. Квартальные авансы — до 28 числа.\n"
+            "• **УСН «Доходы минус расходы» (15%):** выгоден, если подтвержденные расходы превышают 60–70% выручки.\n"
+            "• **Патент (ПСН):** фиксированный налог для розницы, услуг и общепита (до 60 млн ₽ и до 15 сотрудников).\n"
+            "• **АУСН (8% или 20%):** налог рассчитывается автоматически по счету, без деклараций (уплата до 25 числа).\n\n"
+            "🔔 *Ниже вы можете сразу включить напоминание по вашему конкретному налогу или изучить подробный разбор на «Альфа-Курсе».*"
         ),
         "url": "https://kurs.alfabank.ru/catalog?type=courses&utm_source=tg_bot&utm_medium=ip_taxes"
     },
@@ -97,13 +129,13 @@ DEFAULT_CATALOG = [
         "keywords": ["ип", "взносы", "страховые", "отчетность", "декларация", "календарь", "сроки", "уплата"],
         "target_stage": "Действующий микробизнес",
         "is_paid": False,
-        "summary": "Когда и сколько платит ИП за себя, как считать 1% с доходов свыше 300 000 ₽ и как уменьшить налог по УСН и Патенту.",
+        "summary": "Сроки уплаты фиксированных взносов ИП, 1% свыше 300 000 ₽ и правила уменьшения налога УСН/Патента.",
         "full_text": (
-            "💳 **Обязательные платежи и отчетность ИП («Альфа-Курс»):**\n"
-            "• **Фиксированные взносы ИП за себя:** платятся даже при нулевом доходе (кроме ИП на НПД и АУСН). Срок уплаты — до 28 декабря текущего года.\n"
-            "• **Дополнительный взнос 1%:** начисляется на сумму дохода свыше 300 000 ₽ за год. Срок уплаты — до 1 июля следующего года.\n"
-            "• **Авансовые платежи по УСН:** платятся ежеквартально до 28 апреля, 28 июля и 28 октября (уведомление об исчисленных суммах подается до 25-го числа).\n"
-            "• **Годовая декларация по УСН для ИП:** сдается один раз в год — до 25 апреля, а итоговый налог за год уплачивается до 28 апреля."
+            "💳 **Страховые взносы и календарь ИП:**\n\n"
+            "• **Фиксированные взносы ИП за себя:** уплачиваются до **28 декабря** текущего года (кроме ИП на НПД и АУСН).\n"
+            "• **Дополнительный взнос 1%:** с дохода свыше 300 000 ₽ в год — уплачивается до **1 июля** следующего года.\n"
+            "• **Декларация по УСН для ИП:** подается один раз в год до **25 апреля**, уплата годового налога — до **28 апреля**.\n\n"
+            "🔔 *Нажмите кнопку «Напомнить по конкретному налогу» ниже, чтобы не пропустить даты платежей.*"
         ),
         "url": "https://kurs.alfabank.ru/catalog?type=courses&utm_source=tg_bot&utm_medium=ip_vznosy"
     },
@@ -111,15 +143,16 @@ DEFAULT_CATALOG = [
         "id": "mat_ip_kassa",
         "title": "Расчетный счет, онлайн-касса (54-ФЗ) и эквайринг для ИП",
         "category": "Финансы и операции",
-        "keywords": ["ип", "касса", "счет", "эквайринг", "54-фз", "чек", "оплата", "вывод денег"],
+        "keywords": ["ип", "касса", "счет", "эквайринг", "54-фз", "чек", "оплата", "вывод денег", "сбп"],
         "target_stage": "Действующий микробизнес",
         "is_paid": False,
-        "summary": "Кому из ИП нужна онлайн-касса, как подключить торговый и интернет-эквайринг или СБП и как ИП легально выводить деньги со счета на личную карту.",
+        "summary": "Когда нужна онлайн-касса, как принимать оплату по СБП и легально переводить деньги ИП на личную карту.",
         "full_text": (
-            "🧾 **Работа со счетом и кассой для ИП («Альфа-Курс»):**\n"
-            "• **Онлайн-касса (54-ФЗ):** обязательна при приеме оплаты от физлиц (наличными, картой, по QR-коду). Освобождены ИП на НПД, ряд видов деятельности на Патенте и расчеты только между ИП/ООО по безналу.\n"
-            "• **Прием платежей:** подключение СБП (QR-код) с комиссией 0,4–0,7% выгоднее классического эквайринга на старте.\n"
-            "• **Личные деньги ИП:** все средства на расчетном счете после уплаты налогов принадлежат предпринимателю — ИП может свободно переводить их на свою карту физлица с назначением «Перевод собственных средств ИП»."
+            "🧾 **Счет, касса и вывод средств ИП:**\n\n"
+            "• **Онлайн-касса (54-ФЗ):** нужна при приеме оплат от физлиц. Освобождены ИП на НПД, часть видов деятельности на Патенте и расчеты только с юрлицами/ИП по счету.\n"
+            "• **Экономия на комиссиях:** прием платежей по QR-коду (СБП) обходится в 0,4–0,7% вместо стандартного эквайринга.\n"
+            "• **Вывод прибыли:** средства после уплаты налогов можно свободно переводить на личную карту физлица.\n\n"
+            "💡 *Подробные инструкции и чек-листы доступны по ссылке на «Альфа-Курсе».*"
         ),
         "url": "https://kurs.alfabank.ru/catalog?type=courses&utm_source=tg_bot&utm_medium=ip_kassa"
     },
@@ -130,7 +163,7 @@ DEFAULT_CATALOG = [
         "keywords": ["ип", "маркетплейс", "маркетплейсы", "wb", "wildberries", "ozon", "юнит", "продажи", "селлеры"],
         "target_stage": "Действующий микробизнес",
         "is_paid": True,
-        "summary": "Углубленный платный курс для ИП и селлеров: готовые финансовые таблицы расчета маржинальности, комиссий, логистики, маркировки «Честный ЗНАК» и налогов.",
+        "summary": "Углубленный платный курс с готовыми финансовыми таблицами расчета маржинальности, комиссий, логистики и налогов селлера.",
         "full_text": "ЗАКРЫТЫЙ КОНТЕНТ ПЛАТНОГО КУРСА.",
         "url": "https://kurs.alfabank.ru/catalog?type=courses&utm_source=tg_bot&utm_medium=upsell_mp"
     },
@@ -141,13 +174,11 @@ DEFAULT_CATALOG = [
         "keywords": ["ип", "продажи", "отдел продаж", "найм", "сотрудники", "команда", "crm", "масштабирование", "управление"],
         "target_stage": "Развиваю бизнес",
         "is_paid": True,
-        "summary": "Платная программа по оформлению первых сотрудников в ИП, построению отдела продаж, внедрению CRM, скриптам и системе мотивации.",
+        "summary": "Платная программа по оформлению первых сотрудников, построению отдела продаж, внедрению CRM и скриптов.",
         "full_text": "ЗАКРЫТЫЙ КОНТЕНТ ПЛАТНОГО КУРСА.",
         "url": "https://kurs.alfabank.ru/catalog?type=courses&utm_source=tg_bot&utm_medium=upsell_sales"
     }
 ]
-
-CATALOG = DEFAULT_CATALOG
 
 # --- БАЗА ДАННЫХ (Профили и Напоминания) ---
 DB_PATH = "sputnik.db"
@@ -276,119 +307,83 @@ def auto_extract_profile(user_id: int, text: str):
     elif any(w in t for w in ["налог", "взносы", "декларац", "отчетност"]):
         update_user(user_id, "goal", "Налоги, учет и отчетность")
 
-# --- КЛАВИАТУРЫ И НАВИГАЦИЯ ЦИФРАМИ ---
-def start_kb(user_id: int):
-    USER_MENU_STATE[user_id] = {
-        "1": ("stage", "1"),
-        "2": ("stage", "2"),
-        "3": ("stage", "3"),
-        "4": ("nav", "ip_hub"),
-        "5": ("nav", "profile"),
-        "6": ("nav", "reminders"),
-        "7": ("nav", "help")
-    }
+# --- КЛАВИАТУРЫ (БЕЗ ЦИФР) ---
+def start_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1. 🚀 Планирую открыть дело", callback_data="stage_1")],
-        [InlineKeyboardButton(text="2. 🛠 Решаю задачу в микробизнесе", callback_data="stage_2")],
-        [InlineKeyboardButton(text="3. 📈 Хочу системно развить бизнес", callback_data="stage_3")],
-        [InlineKeyboardButton(text="4. 🏢 Всё об ИП: открытие с нуля и гид", callback_data="nav_ip_hub")],
+        [InlineKeyboardButton(text="🚀 Планирую открыть дело", callback_data="stage_1")],
+        [InlineKeyboardButton(text="🛠 Решаю задачу в микробизнесе", callback_data="stage_2")],
+        [InlineKeyboardButton(text="📈 Хочу системно развить бизнес", callback_data="stage_3")],
+        [InlineKeyboardButton(text="🏢 Всё об ИП: открытие с нуля и налоги", callback_data="nav_ip_hub")],
         [
-            InlineKeyboardButton(text="5. 📋 Мой профиль", callback_data="nav_profile"),
-            InlineKeyboardButton(text="6. ⏰ Напоминания", callback_data="nav_reminders")
+            InlineKeyboardButton(text="📋 Мой профиль", callback_data="nav_profile"),
+            InlineKeyboardButton(text="⏰ Напоминания", callback_data="nav_reminders")
         ],
-        [InlineKeyboardButton(text="7. ❓ Помощь и все функции", callback_data="nav_help")]
+        [InlineKeyboardButton(text="❓ Помощь и все функции", callback_data="nav_help")]
     ])
 
-def profile_kb(user_id: int):
-    USER_MENU_STATE[user_id] = {
-        "1": ("submenu", "goal"),
-        "2": ("submenu", "tax"),
-        "3": ("submenu", "stage"),
-        "4": ("nav", "start")
-    }
+def profile_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1. 🎯 Изменить текущий фокус", callback_data="submenu_goal")],
-        [InlineKeyboardButton(text="2. 💼 Изменить налоговый режим", callback_data="submenu_tax")],
-        [InlineKeyboardButton(text="3. 🚀 Изменить стадию бизнеса", callback_data="submenu_stage")],
-        [InlineKeyboardButton(text="4. 🏠 В главное меню", callback_data="nav_start")]
+        [InlineKeyboardButton(text="🎯 Изменить текущий фокус", callback_data="submenu_goal")],
+        [InlineKeyboardButton(text="💼 Изменить налоговый режим", callback_data="submenu_tax")],
+        [InlineKeyboardButton(text="🚀 Изменить стадию бизнеса", callback_data="submenu_stage")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
     ])
 
-def goal_selection_kb(user_id: int):
-    USER_MENU_STATE[user_id] = {
-        "1": ("goal", "1"),
-        "2": ("goal", "2"),
-        "3": ("goal", "3"),
-        "4": ("goal", "4"),
-        "5": ("goal", "5"),
-        "6": ("goal_custom", "custom"),
-        "7": ("nav", "profile")
-    }
+def goal_selection_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1. 🏢 Открытие ИП и регистрация бизнеса", callback_data="goal_1")],
-        [InlineKeyboardButton(text="2. 📊 Налоги, учет и отчетность", callback_data="goal_2")],
-        [InlineKeyboardButton(text="3. 📣 Маркетинг и привлечение клиентов", callback_data="goal_3")],
-        [InlineKeyboardButton(text="4. 🛍 Выход на маркетплейсы и продажи", callback_data="goal_4")],
-        [InlineKeyboardButton(text="5. 👥 Систематизация и найм команды", callback_data="goal_5")],
-        [InlineKeyboardButton(text="6. ✍️ Ввести свой фокус текстом", callback_data="goal_custom")],
-        [InlineKeyboardButton(text="7. ⬅️ Назад в профиль", callback_data="nav_profile")]
+        [InlineKeyboardButton(text="🏢 Открытие ИП и регистрация бизнеса", callback_data="goal_1")],
+        [InlineKeyboardButton(text="📊 Налоги, учет и отчетность", callback_data="goal_2")],
+        [InlineKeyboardButton(text="📣 Маркетинг и привлечение клиентов", callback_data="goal_3")],
+        [InlineKeyboardButton(text="🛍 Выход на маркетплейсы и продажи", callback_data="goal_4")],
+        [InlineKeyboardButton(text="👥 Систематизация и найм команды", callback_data="goal_5")],
+        [InlineKeyboardButton(text="✍️ Ввести свой фокус текстом", callback_data="goal_custom")],
+        [InlineKeyboardButton(text="⬅️ Назад в профиль", callback_data="nav_profile")]
     ])
 
-def tax_selection_kb(user_id: int):
-    USER_MENU_STATE[user_id] = {
-        "1": ("tax", "1"),
-        "2": ("tax", "2"),
-        "3": ("tax", "3"),
-        "4": ("tax", "4"),
-        "5": ("tax", "5"),
-        "6": ("nav", "profile")
-    }
+def tax_selection_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="1. УСН", callback_data="tax_1"),
-            InlineKeyboardButton(text="2. НПД (Самозанятый)", callback_data="tax_2")
+            InlineKeyboardButton(text="УСН", callback_data="tax_1"),
+            InlineKeyboardButton(text="НПД (Самозанятый)", callback_data="tax_2")
         ],
         [
-            InlineKeyboardButton(text="3. Патент (ПСН)", callback_data="tax_3"),
-            InlineKeyboardButton(text="4. АУСН", callback_data="tax_4")
+            InlineKeyboardButton(text="Патент (ПСН)", callback_data="tax_3"),
+            InlineKeyboardButton(text="АУСН", callback_data="tax_4")
         ],
         [
-            InlineKeyboardButton(text="5. ОСНО", callback_data="tax_5"),
-            InlineKeyboardButton(text="6. ⬅️ Назад в профиль", callback_data="nav_profile")
+            InlineKeyboardButton(text="ОСНО", callback_data="tax_5"),
+            InlineKeyboardButton(text="⬅️ Назад в профиль", callback_data="nav_profile")
         ]
     ])
 
-def stage_selection_kb(user_id: int):
-    USER_MENU_STATE[user_id] = {
-        "1": ("stage", "1"),
-        "2": ("stage", "2"),
-        "3": ("stage", "3"),
-        "4": ("nav", "profile")
-    }
+def stage_selection_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1. 🚀 Планирую открыть дело", callback_data="stage_1")],
-        [InlineKeyboardButton(text="2. 🛠 Действующий микробизнес", callback_data="stage_2")],
-        [InlineKeyboardButton(text="3. 📈 Развиваю бизнес", callback_data="stage_3")],
-        [InlineKeyboardButton(text="4. ⬅️ Назад в профиль", callback_data="nav_profile")]
+        [InlineKeyboardButton(text="🚀 Планирую открыть дело", callback_data="stage_1")],
+        [InlineKeyboardButton(text="🛠 Действующий микробизнес", callback_data="stage_2")],
+        [InlineKeyboardButton(text="📈 Развиваю бизнес", callback_data="stage_3")],
+        [InlineKeyboardButton(text="⬅️ Назад в профиль", callback_data="nav_profile")]
     ])
 
-def ip_hub_kb(user_id: int):
-    USER_MENU_STATE[user_id] = {
-        "1": ("mat", "mat_ip_start"),
-        "2": ("mat", "mat_ip_taxes"),
-        "3": ("mat", "mat_ip_vznosy"),
-        "4": ("mat", "mat_ip_kassa"),
-        "5": ("mat", "mat_mp_paid"),
-        "6": ("nav", "reminders"),
-        "7": ("nav", "start")
-    }
+def ip_hub_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1. 📝 Как открыть ИП с нуля за 0 ₽ (Пошагово)", callback_data="mat_mat_ip_start")],
-        [InlineKeyboardButton(text="2. 📊 Налоги для ИП: УСН, НПД, Патент, АУСН", callback_data="mat_mat_ip_taxes")],
-        [InlineKeyboardButton(text="3. 💳 Страховые взносы ИП и сроки отчетности", callback_data="mat_mat_ip_vznosy")],
-        [InlineKeyboardButton(text="4. 🧾 Счет, онлайн-касса (54-ФЗ) и вывод денег ИП", callback_data="mat_mat_ip_kassa")],
-        [InlineKeyboardButton(text="5. 🎓 Курс: Выход ИП на маркетплейсы", callback_data="mat_mat_mp_paid")],
-        [InlineKeyboardButton(text="6. ⏰ Настроить напоминания о налогах ИП", callback_data="nav_reminders")],
-        [InlineKeyboardButton(text="7. 🏠 В главное меню", callback_data="nav_start")]
+        [InlineKeyboardButton(text="📝 Как открыть ИП с нуля за 0 ₽", callback_data="mat_mat_ip_start")],
+        [InlineKeyboardButton(text="📊 Налоги для ИП: выбор режима", callback_data="mat_mat_ip_taxes")],
+        [InlineKeyboardButton(text="🔔 Напомнить по конкретному налогу", callback_data="nav_tax_reminders")],
+        [InlineKeyboardButton(text="💳 Страховые взносы ИП и отчетность", callback_data="mat_mat_ip_vznosy")],
+        [InlineKeyboardButton(text="🧾 Счет, онлайн-касса и вывод денег", callback_data="mat_mat_ip_kassa")],
+        [InlineKeyboardButton(text="🎓 Курс: Выход ИП на маркетплейсы", callback_data="mat_mat_mp_paid")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
+    ])
+
+def specific_tax_reminders_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📌 УСН (авансы и налог — до 28 числа)", callback_data="addtaxrem_usn")],
+        [InlineKeyboardButton(text="📌 НПД / Самозанятость (до 28 числа)", callback_data="addtaxrem_npd")],
+        [InlineKeyboardButton(text="📌 Патент / ПСН (контроль сроков оплаты)", callback_data="addtaxrem_psn")],
+        [InlineKeyboardButton(text="📌 Страховые взносы ИП (28 дек / 1 июля)", callback_data="addtaxrem_vznosy")],
+        [InlineKeyboardButton(text="📌 АУСН (ежемесячно до 25 числа)", callback_data="addtaxrem_ausn")],
+        [InlineKeyboardButton(text="⏰ Мои активные напоминания", callback_data="nav_reminders")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
     ])
 
 def reminder_control_kb(rem_id: int):
@@ -408,10 +403,10 @@ async def send_start_screen(msg: Message, user_id: int):
     await msg.answer(
         "Привет! Я **Альфа-Спутник** — ваш ИИ-помощник по платформе «Альфа-Курс».\n\n"
         "• Ищу материалы по **ключевым словам** (напишите, например, `ИП`, `налоги` или `маркетплейс`)\n"
-        "• Подбираю пошаговые инструкции и курсы под вашу задачу\n"
-        "• Напоминаю об учебе и сроках уплаты налогов\n\n"
-        "👇 **Нажмите кнопку или отправьте цифру (1–7) в чат:**",
-        reply_markup=start_kb(user_id),
+        "• Подбираю короткие инструкции и курсы под вашу задачу\n"
+        "• Настраиваю напоминания об учебе и по конкретным налогам\n\n"
+        "👇 **Выберите нужный раздел или напишите свой вопрос в чат:**",
+        reply_markup=start_kb(),
         parse_mode="Markdown"
     )
 
@@ -422,117 +417,110 @@ async def send_stage_response(msg: Message, user_id: int, stage_code: str):
 
     if stage_code == "1":
         update_user(user_id, "goal", "Открытие ИП и регистрация бизнеса")
-        USER_MENU_STATE[user_id] = {
-            "1": ("mat", "mat_ip_start"),
-            "2": ("mat", "mat_ip_taxes"),
-            "3": ("nav", "ip_hub"),
-            "4": ("nav", "start")
-        }
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="1. 📝 Пошаговый гид: Как открыть ИП с нуля", callback_data="mat_mat_ip_start")],
-            [InlineKeyboardButton(text="2. 📊 Сравнение налогов для старта (УСН / НПД)", callback_data="mat_mat_ip_taxes")],
-            [InlineKeyboardButton(text="3. 🏢 Открыть раздел «Всё об ИП»", callback_data="nav_ip_hub")],
-            [InlineKeyboardButton(text="4. 🏠 В главное меню", callback_data="nav_start")]
+            [InlineKeyboardButton(text="📝 Как открыть ИП с нуля и без госпошлины", callback_data="mat_mat_ip_start")],
+            [InlineKeyboardButton(text="📊 Сравнение налогов для старта (УСН / НПД)", callback_data="mat_mat_ip_taxes")],
+            [InlineKeyboardButton(text="🔔 Настроить напоминание по налогу", callback_data="nav_tax_reminders")],
+            [InlineKeyboardButton(text="🏢 Открыть раздел «Всё об ИП»", callback_data="nav_ip_hub")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
         ])
         await msg.answer(
-            f"🚀 **Отличный старт! Стадия: «{stage_title}» сохранена в профиль.**\n\n"
-            "Для запуска бизнеса без штрафов и лишних расходов на «Альфа-Курсе» подготовлен стартовый маршрут:\n"
-            "• **Шаг 1:** Определить форму (Самозанятость или ИП) и коды ОКВЭД.\n"
-            "• **Шаг 2:** Сразу подать уведомление на выгодный налоговый режим (например, УСН 6% или АУСН).\n"
-            "• **Шаг 3:** Зарегистрировать бизнес онлайн без госпошлины 800 ₽.\n\n"
-            "👇 **С чего начнем? Выберите кнопкой или отправьте цифру 1–4:**",
+            f"🚀 **Стадия «{stage_title}» сохранена в профиль.**\n\n"
+            "Для быстрого старта без штрафов рекомендуем:\n"
+            "• Определить форму бизнеса и коды ОКВЭД\n"
+            "• Сразу выбрать выгодный налоговый режим (УСН или НПД)\n"
+            "• Подать заявку онлайн без уплаты госпошлины 800 ₽\n\n"
+            "👇 **С чего начнем?**",
             reply_markup=kb,
             parse_mode="Markdown"
         )
 
     elif stage_code == "2":
         update_user(user_id, "goal", "Налоги, учет и отчетность")
-        USER_MENU_STATE[user_id] = {
-            "1": ("mat", "mat_ip_vznosy"),
-            "2": ("mat", "mat_ip_kassa"),
-            "3": ("mat", "mat_mp_paid"),
-            "4": ("nav", "reminders"),
-            "5": ("nav", "start")
-        }
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="1. 💳 Взносы ИП, уменьшение УСН и сроки", callback_data="mat_mat_ip_vznosy")],
-            [InlineKeyboardButton(text="2. 🧾 Онлайн-касса (54-ФЗ), СБП и вывод денег", callback_data="mat_mat_ip_kassa")],
-            [InlineKeyboardButton(text="3. 🛍 Курс: Юнит-экономика на маркетплейсах", callback_data="mat_mat_mp_paid")],
-            [InlineKeyboardButton(text="4. ⏰ Настроить налоговый календарь", callback_data="nav_reminders")],
-            [InlineKeyboardButton(text="5. 🏠 В главное меню", callback_data="nav_start")]
+            [InlineKeyboardButton(text="💳 Страховые взносы ИП и уменьшение налога", callback_data="mat_mat_ip_vznosy")],
+            [InlineKeyboardButton(text="🔔 Напомнить по конкретному налогу", callback_data="nav_tax_reminders")],
+            [InlineKeyboardButton(text="🧾 Онлайн-касса (54-ФЗ), СБП и вывод денег", callback_data="mat_mat_ip_kassa")],
+            [InlineKeyboardButton(text="🛍 Курс: Юнит-экономика на маркетплейсах", callback_data="mat_mat_mp_paid")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
         ])
         await msg.answer(
-            f"🛠 **Понял вас! Стадия: «{stage_title}» сохранена.**\n\n"
-            "Владельцам действующего микробизнеса важны быстрые прикладные решения и готовые шаблоны:\n"
-            "• Как уменьшить налог УСН/Патент за счет страховых взносов ИП\n"
-            "• Как работать с онлайн-кассой, эквайрингом и легально выводить прибыль\n"
-            "• Как посчитать маржинальность товара перед отгрузкой на маркетплейс\n\n"
-            "👇 **Выберите нужный инструмент (кнопкой или цифрой 1–5):**",
+            f"🛠 **Стадия «{stage_title}» сохранена.**\n\n"
+            "Подборка практических решений для действующего микробизнеса:\n"
+            "• Как уменьшить налог УСН или Патент за счет взносов ИП\n"
+            "• Как настроить напоминание по вашему конкретному налогу\n"
+            "• Как работать с кассой и считать маржинальность на маркетплейсах\n\n"
+            "👇 **Выберите нужную тему:**",
             reply_markup=kb,
             parse_mode="Markdown"
         )
 
     else:
         update_user(user_id, "goal", "Систематизация и найм команды")
-        USER_MENU_STATE[user_id] = {
-            "1": ("mat", "mat_sales_paid"),
-            "2": ("mat", "mat_mp_paid"),
-            "3": ("submenu", "goal"),
-            "4": ("nav", "start")
-        }
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="1. 👥 Курс: Построение отдела продаж и найм", callback_data="mat_mat_sales_paid")],
-            [InlineKeyboardButton(text="2. 📈 Курс: Масштабирование на маркетплейсах", callback_data="mat_mat_mp_paid")],
-            [InlineKeyboardButton(text="3. 🎯 Настроить свой фокус развития", callback_data="submenu_goal")],
-            [InlineKeyboardButton(text="4. 🏠 В главное меню", callback_data="nav_start")]
+            [InlineKeyboardButton(text="👥 Курс: Построение отдела продаж и найм", callback_data="mat_mat_sales_paid")],
+            [InlineKeyboardButton(text="📈 Курс: Масштабирование на маркетплейсах", callback_data="mat_mat_mp_paid")],
+            [InlineKeyboardButton(text="🎯 Настроить свой фокус развития", callback_data="submenu_goal")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
         ])
         await msg.answer(
-            f"📈 **Масштабирование! Стадия: «{stage_title}» сохранена.**\n\n"
-            "Когда бизнес перерастает ручное управление, «Альфа-Курс» помогает выстроить систему:\n"
-            "• Оформление первых сотрудников в ИП/ООО и система мотивации KPI\n"
+            f"📈 **Стадия «{stage_title}» сохранена.**\n\n"
+            "Материалы «Альфа-Курса» для системного роста:\n"
+            "• Оформление первых сотрудников в ИП/ООО и мотивация команды\n"
             "• Внедрение CRM, скриптов продаж и контроль конверсии\n"
-            "• Углубленное обучение финансовому планированию и юнит-экономике\n\n"
-            "👇 **Выберите программу для изучения (кнопкой или цифрой 1–4):**",
+            "• Финансовое планирование и масштабирование на маркетплейсах\n\n"
+            "👇 **Выберите программу для изучения:**",
             reply_markup=kb,
             parse_mode="Markdown"
         )
 
 async def send_ip_hub_screen(msg: Message, user_id: int):
-    """Специальный раздел «Всё об ИП» с гайдом открытия с нуля и базой Альфа-Курса."""
+    """Упрощенный и наглядный раздел «Всё об ИП» со ссылкой на Альфа-Курс."""
     AWAITING_CUSTOM_GOAL.discard(user_id)
     await msg.answer(
-        "🏢 **Раздел «Всё об ИП»: открытие с нуля и база знаний «Альфа-Курса»**\n\n"
-        "**Краткий чек-лист: как открыть ИП с нуля:**\n"
-        "1️⃣ **Подберите коды ОКВЭД** (1 основной + дополнительные по справочнику).\n"
-        "2️⃣ **Выберите налоговый режим:** УСН 6% (для услуг), УСН 15% (при больших расходах), Патент или НПД.\n"
-        "3️⃣ **Подайте заявление Р21001 онлайн** через сервис Альфа-Банка или Госуслуги — **госпошлина 800 ₽ не взимается**.\n"
-        "4️⃣ **Получите лист записи ЕГРИП** через 1–3 дня и откройте расчетный счет для приема оплат.\n\n"
-        "📚 **Полезные материалы об ИП на «Альфа-Курсе»:**\n"
-        "Выберите интересующую тему ниже (кнопкой или отправьте **цифру 1–7** в чат):",
-        reply_markup=ip_hub_kb(user_id),
+        "🏢 **Всё об ИП: быстрый старт и база «Альфа-Курса»**\n\n"
+        "**Как открыть ИП с нуля и без госпошлины — 3 простых шага:**\n"
+        "• **Коды и налоги:** выберите ОКВЭД и режим (УСН 6%/15%, Патент или НПД).\n"
+        "• **Онлайн-заявка за 0 ₽:** отправьте заявление через сервис Альфа-Банка или Госуслуги без пошлины 800 ₽.\n"
+        "• **Счет за 1–3 дня:** получите лист записи ЕГРИП на почту и откройте расчетный счет.\n\n"
+        "🔗 Узнать все подробности и скачать шаблоны можно на [платформе «Альфа-Курс»](https://kurs.alfabank.ru/catalog?type=courses&utm_source=tg_bot&utm_medium=ip_hub).\n\n"
+        "👇 **Выберите интересующую тему ниже:**",
+        reply_markup=ip_hub_kb(),
+        parse_mode="Markdown",
+        disable_web_page_preview=True
+    )
+
+async def send_tax_reminders_menu(msg: Message, user_id: int):
+    """Меню выбора напоминания по конкретному налогу."""
+    AWAITING_CUSTOM_GOAL.discard(user_id)
+    u = get_user(user_id)
+    await msg.answer(
+        "🔔 **Напоминание по конкретному налогу**\n\n"
+        f"Ваш текущий режим в профиле: **{u['tax_regime']}**.\n"
+        "Выберите налог или взнос из списка ниже — я сразу покажу точные сроки уплаты и добавлю персональное напоминание:",
+        reply_markup=specific_tax_reminders_kb(),
         parse_mode="Markdown"
     )
 
 async def send_material_card(msg: Message, user_id: int, mat_id: str):
-    """Показывает выбранный материал с соблюдением Ограничения 06 (защита платных курсов)."""
+    """Показывает карточку материала (с кнопкой напоминания по конкретному налогу в налоговых темах)."""
     item = get_material_by_id(mat_id)
     if not item:
         await msg.answer("Материал не найден. Нажмите `/start` для возврата в меню.")
         return
 
-    USER_MENU_STATE[user_id] = {
-        "1": ("nav", "ip_hub"),
-        "2": ("nav", "reminders"),
-        "3": ("nav", "start")
-    }
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Открыть материал на «Альфа-Курсе»", url=item["url"])],
-        [
-            InlineKeyboardButton(text="1. 🏢 В раздел об ИП", callback_data="nav_ip_hub"),
-            InlineKeyboardButton(text="2. ⏰ Напомнить изучить", callback_data="nav_reminders")
-        ],
-        [InlineKeyboardButton(text="3. 🏠 В главное меню", callback_data="nav_start")]
-    ])
+    is_tax_topic = mat_id in ("mat_ip_taxes", "mat_ip_vznosy")
+    buttons = [
+        [InlineKeyboardButton(text="🔗 Узнать подробнее на «Альфа-Курсе»", url=item["url"])]
+    ]
+    if is_tax_topic:
+        buttons.append([InlineKeyboardButton(text="🔔 Напомнить по конкретному налогу", callback_data="nav_tax_reminders")])
+    else:
+        buttons.append([InlineKeyboardButton(text="⏰ Напомнить изучить материал", callback_data="nav_reminders")])
+
+    buttons.append([InlineKeyboardButton(text="🏢 В раздел «Всё об ИП»", callback_data="nav_ip_hub")])
+    buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     if item["is_paid"]:
         await msg.answer(
@@ -540,15 +528,15 @@ async def send_material_card(msg: Message, user_id: int, mat_id: str):
             f"• **Кому подойдет:** {item['target_stage']}\n"
             f"• **Чем полезен курс:** {item['summary']}\n\n"
             f"_🔒 Подробные уроки, видео и расчетные таблицы доступны после приобретения курса на платформе._\n\n"
-            f"➡️ **Следующий шаг:** перейдите по кнопке ниже на страницу курса или выберите действие (цифры 1–3):",
+            f"👇 **Перейдите по ссылке ниже, чтобы узнать подробнее:**",
             reply_markup=kb,
             parse_mode="Markdown"
         )
     else:
         await msg.answer(
-            f"📖 **Материал «Альфа-Курса»:**\n**«{item['title']}»**\n\n"
+            f"📖 **{item['title']}**\n\n"
             f"{item['full_text']}\n\n"
-            f"➡️ **Следующий шаг:** откройте полную версию с шаблонами на платформе по кнопке ниже или отправьте цифру (1–3):",
+            f"👇 **Перейдите на «Альфа-Курс» по кнопке ниже, чтобы узнать подробнее:**",
             reply_markup=kb,
             parse_mode="Markdown"
         )
@@ -562,39 +550,29 @@ async def send_profile_screen(msg: Message, user_id: int):
         f"• **Налоговый режим:** {u['tax_regime']}\n"
         f"• **Текущий фокус:** {u['goal']}\n\n"
         f"_Я учитываю эти данные при подборе курсов и расчете дат налогов._\n"
-        f"👇 **Выберите, что хотите изменить (кнопкой или цифрой 1–4 в чат):**",
-        reply_markup=profile_kb(user_id),
+        f"👇 **Выберите параметр, который хотите изменить:**",
+        reply_markup=profile_kb(),
         parse_mode="Markdown"
     )
 
 async def send_help_screen(msg: Message, user_id: int):
     AWAITING_CUSTOM_GOAL.discard(user_id)
-    USER_MENU_STATE[user_id] = {
-        "1": ("nav", "ip_hub"),
-        "2": ("nav", "profile"),
-        "3": ("nav", "reminders"),
-        "4": ("nav", "demo_push"),
-        "5": ("nav", "start")
-    }
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1. 🏢 Всё об ИП: открытие с нуля и гид", callback_data="nav_ip_hub")],
-        [InlineKeyboardButton(text="2. 📋 Открыть и настроить мой профиль", callback_data="nav_profile")],
-        [InlineKeyboardButton(text="3. ⏰ Управление напоминаниями", callback_data="nav_reminders")],
-        [InlineKeyboardButton(text="4. ⚡ Тест пуш-уведомления (10 сек)", callback_data="nav_demo_push")],
-        [InlineKeyboardButton(text="5. 🏠 В главное меню", callback_data="nav_start")]
+        [InlineKeyboardButton(text="🏢 Всё об ИП: открытие с нуля и гид", callback_data="nav_ip_hub")],
+        [InlineKeyboardButton(text="🔔 Напомнить по конкретному налогу", callback_data="nav_tax_reminders")],
+        [InlineKeyboardButton(text="📋 Открыть и настроить мой профиль", callback_data="nav_profile")],
+        [InlineKeyboardButton(text="⏰ Управление напоминаниями", callback_data="nav_reminders")],
+        [InlineKeyboardButton(text="⚡ Тест пуш-уведомления (10 сек)", callback_data="nav_demo_push")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
     ])
     await msg.answer(
         "❓ **Все функции бота «Альфа-Спутник»**\n\n"
-        "🔹 **1. Поиск по ключевым словам и ИИ-ответы**\n"
-        "Напишите ключевое слово (например: `ИП`, `налоги`, `взносы`, `касса`, `маркетплейс`) — бот предложит список подходящих тем из «Альфа-Курса» на выбор!\n\n"
-        "🔹 **2. Раздел «Всё об ИП» (`/ip`)**\n"
-        "Пошаговая инструкция по открытию ИП с нуля за 0 ₽, выбору налогов, уплате взносов и работе со счетом.\n\n"
-        "🔹 **3. Настройка профиля и Текущего фокуса (`/profile`)**\n"
-        "Вы можете в любой момент изменить свой **Текущий фокус**, стадию и налоговый режим.\n\n"
-        "🔹 **4. Напоминания и налоговый календарь (`/reminders` и `/demo_push`)**\n"
-        "Гибкая настройка частоты напоминаний об учебе и налогах + мгновенный тест через 10 секунд.\n\n"
-        "🔢 **Управление цифрами:** в любом меню можно просто отправить цифру нужного пункта в чат!\n\n"
-        "👇 *Выберите раздел кнопкой или цифрой 1–5:*",
+        "• **Поиск по ключевым словам и ИИ-ответы:** напишите слово (например, `ИП`, `налоги`, `взносы`, `касса`, `маркетплейс`) — бот предложит подходящие материалы из «Альфа-Курса».\n"
+        "• **Раздел «Всё об ИП» (`/ip`):** краткий гид по открытию ИП с нуля без госпошлины и прямые ссылки на «Альфа-Курс».\n"
+        "• **Напоминания по конкретному налогу:** выберите УСН, НПД, Патент, взносы ИП или АУСН, чтобы вовремя получать уведомления о сроках уплаты.\n"
+        "• **Профиль бизнеса (`/profile`):** настройка стадии бизнеса, налогового режима и вашего **Текущего фокуса**.\n"
+        "• **Демо-пуш (`/demo_push`):** проверка живого уведомления за 10 секунд.\n\n"
+        "👇 **Выберите нужный раздел:**",
         reply_markup=kb,
         parse_mode="Markdown"
     )
@@ -625,6 +603,8 @@ async def cb_navigation(call: CallbackQuery):
         await send_start_screen(call.message, uid)
     elif target == "ip_hub":
         await send_ip_hub_screen(call.message, uid)
+    elif target == "tax_reminders":
+        await send_tax_reminders_menu(call.message, uid)
     elif target == "profile":
         await send_profile_screen(call.message, uid)
     elif target == "help":
@@ -638,23 +618,22 @@ async def cb_navigation(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("submenu_"))
 async def cb_submenu(call: CallbackQuery):
     sub = call.data.replace("submenu_", "")
-    uid = call.from_user.id
     if sub == "goal":
         await call.message.answer(
-            "🎯 **Выберите ваш текущий фокус** (нажмите кнопку или отправьте цифру **1–7** в чат):",
-            reply_markup=goal_selection_kb(uid),
+            "🎯 **Выберите ваш текущий фокус:**",
+            reply_markup=goal_selection_kb(),
             parse_mode="Markdown"
         )
     elif sub == "tax":
         await call.message.answer(
-            "💼 **Выберите налоговый режим** (нажмите кнопку или отправьте цифру **1–6** в чат):",
-            reply_markup=tax_selection_kb(uid),
+            "💼 **Выберите ваш налоговый режим:**",
+            reply_markup=tax_selection_kb(),
             parse_mode="Markdown"
         )
     elif sub == "stage":
         await call.message.answer(
-            "🚀 **Выберите стадию вашего бизнеса** (нажмите кнопку или отправьте цифру **1–4** в чат):",
-            reply_markup=stage_selection_kb(uid),
+            "🚀 **Выберите стадию вашего бизнеса:**",
+            reply_markup=stage_selection_kb(),
             parse_mode="Markdown"
         )
     await call.answer()
@@ -677,6 +656,47 @@ async def cb_set_tax(call: CallbackQuery):
     )
     await send_profile_screen(call.message, uid)
     await call.answer()
+
+@dp.callback_query(F.data.startswith("addtaxrem_"))
+async def cb_add_specific_tax_reminder(call: CallbackQuery):
+    """Создает напоминание по конкретному выбранному налогу."""
+    tax_key = call.data.replace("addtaxrem_", "")
+    uid = call.from_user.id
+    info = SPECIFIC_TAX_REMINDERS.get(tax_key)
+    if not info:
+        await call.answer("Налог не найден")
+        return
+
+    if info["regime"]:
+        update_user(uid, "tax_regime", info["regime"])
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "INSERT INTO reminders (user_id, title, frequency, active) VALUES (?, ?, ?, 1)",
+            (uid, info["reminder_title"], "weekly")
+        )
+        rem_id = cur.lastrowid
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Раз в день", callback_data=f"freq_{rem_id}_daily"),
+            InlineKeyboardButton(text="Раз в 3 дня", callback_data=f"freq_{rem_id}_every_3_days"),
+            InlineKeyboardButton(text="Раз в неделю", callback_data=f"freq_{rem_id}_weekly")
+        ],
+        [InlineKeyboardButton(text="⚡ Проверить отправку сейчас (10 сек)", callback_data="nav_demo_push")],
+        [InlineKeyboardButton(text="🔕 Отключить напоминание", callback_data=f"freq_{rem_id}_off")],
+        [InlineKeyboardButton(text="⬅️ Выбрать другой налог", callback_data="nav_tax_reminders")]
+    ])
+
+    await call.message.answer(
+        f"✅ **Напоминание по налогу «{info['name']}» включено!**\n\n"
+        f"📅 **Сроки уплаты:** {info['schedule_info']}\n"
+        f"🔔 **Частота по умолчанию:** Раз в неделю.\n\n"
+        f"Вы можете сразу изменить частоту напоминаний или протестировать уведомление кнопками ниже:",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+    await call.answer("Напоминание создано!")
 
 @dp.callback_query(F.data == "goal_custom")
 async def cb_goal_custom(call: CallbackQuery):
@@ -733,7 +753,7 @@ async def trigger_demo_push(msg: Message, user_id: int):
         args=[
             user_id,
             f"Пора уделить 15 минут обучению по вашему фокусу «{u['goal']}»! "
-            f"Также проверьте календарь отчетности ({u['tax_regime']})."
+            f"Также проверьте календарь отчетности по режиму «{u['tax_regime']}»."
         ]
     )
     await msg.answer(
@@ -764,7 +784,7 @@ async def show_reminders(event: Message | CallbackQuery):
             )
             conn.execute(
                 "INSERT INTO reminders (user_id, title, frequency) VALUES (?, ?, ?)",
-                (user_id, f"Проверка сроков уплаты налога и взносов ({u['tax_regime']})", "weekly")
+                (user_id, f"Проверка сроков уплаты налога ({u['tax_regime']})", "weekly")
             )
             cur = conn.execute("SELECT id, title, frequency, active FROM reminders WHERE user_id = ?", (user_id,))
             rows = cur.fetchall()
@@ -783,6 +803,13 @@ async def show_reminders(event: Message | CallbackQuery):
             reply_markup=reminder_control_kb(r_id),
             parse_mode="Markdown"
         )
+
+    extra_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔔 Добавить напоминание по конкретному налогу", callback_data="nav_tax_reminders")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
+    ])
+    await msg.answer("Хотите добавить напоминание по конкретному налогу или взносу?", reply_markup=extra_kb)
+
     if isinstance(event, CallbackQuery):
         await event.answer()
 
@@ -799,60 +826,7 @@ async def cb_change_freq(call: CallbackQuery):
     )
     await call.answer("Частота обновлена!")
 
-# --- ВЫПОЛНЕНИЕ ДЕЙСТВИЙ ПО ЦИФРАМ ---
-async def execute_numbered_action(message: Message, action_type: str, value: str):
-    uid = message.from_user.id
-    if action_type == "stage":
-        await send_stage_response(message, uid, value)
-    elif action_type == "tax":
-        tax_name = TAX_MAP.get(value, "УСН")
-        update_user(uid, "tax_regime", tax_name)
-        await message.answer(f"✅ Налоговый режим обновлен на **{tax_name}**!", parse_mode="Markdown")
-        await send_profile_screen(message, uid)
-    elif action_type == "goal":
-        goal_name = GOAL_MAP.get(value, "Развитие бизнеса")
-        update_user(uid, "goal", goal_name)
-        await message.answer(f"✅ Текущий фокус успешно изменен на: **{goal_name}**!", parse_mode="Markdown")
-        await send_profile_screen(message, uid)
-    elif action_type == "goal_custom":
-        AWAITING_CUSTOM_GOAL.add(uid)
-        await message.answer("✍️ Напишите в чат вашу текущую цель или задачу для бизнеса:")
-    elif action_type == "mat":
-        await send_material_card(message, uid, value)
-    elif action_type == "submenu":
-        if value == "goal":
-            await message.answer(
-                "🎯 **Выберите ваш текущий фокус** (кнопкой или цифрой **1–7** в чат):",
-                reply_markup=goal_selection_kb(uid),
-                parse_mode="Markdown"
-            )
-        elif value == "tax":
-            await message.answer(
-                "💼 **Выберите налоговый режим** (кнопкой или цифрой **1–6** в чат):",
-                reply_markup=tax_selection_kb(uid),
-                parse_mode="Markdown"
-            )
-        elif value == "stage":
-            await message.answer(
-                "🚀 **Выберите стадию вашего бизнеса** (кнопкой или цифрой **1–4** в чат):",
-                reply_markup=stage_selection_kb(uid),
-                parse_mode="Markdown"
-            )
-    elif action_type == "nav":
-        if value == "start":
-            await send_start_screen(message, uid)
-        elif value == "ip_hub":
-            await send_ip_hub_screen(message, uid)
-        elif value == "profile":
-            await send_profile_screen(message, uid)
-        elif value == "help":
-            await send_help_screen(message, uid)
-        elif value == "reminders":
-            await show_reminders(message)
-        elif value == "demo_push":
-            await trigger_demo_push(message, uid)
-
-# --- ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ, КЛЮЧЕВЫХ СЛОВ И ЦИФР ---
+# --- ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ И ПОИСКА ПО КЛЮЧЕВЫМ СЛОВАМ ---
 @dp.message()
 async def handle_question(message: Message):
     user_id = message.from_user.id
@@ -860,62 +834,28 @@ async def handle_question(message: Message):
     if not text:
         return
 
-    # 0. Если пользователь вводит собственный «Текущий фокус» текстом
-    if user_id in AWAITING_CUSTOM_GOAL and not text.isdigit():
+    # 1. Если пользователь вводит собственный «Текущий фокус» текстом
+    if user_id in AWAITING_CUSTOM_GOAL:
         AWAITING_CUSTOM_GOAL.discard(user_id)
         update_user(user_id, "goal", text[:80])
         await message.answer(f"✅ Ваш персональный фокус сохранен: **{text[:80]}**!", parse_mode="Markdown")
         await send_profile_screen(message, user_id)
         return
 
-    # 1. Навигация по боту при помощи цифр (1, 2, 3...)
-    if text.isdigit():
-        if user_id not in USER_MENU_STATE:
-            start_kb(user_id)
-        menu_map = USER_MENU_STATE.get(user_id, {})
-        if text in menu_map:
-            action_type, val = menu_map[text]
-            await execute_numbered_action(message, action_type, val)
-            return
-        else:
-            valid_keys = ", ".join(menu_map.keys())
-            await message.answer(
-                f"🔢 В текущем меню доступны цифры: **{valid_keys}**.\n"
-                f"Отправьте одну из них или нажмите `/start` для главного меню.",
-                parse_mode="Markdown"
-            )
-            return
-
     # 2. Автоматическое обогащение профиля
     auto_extract_profile(user_id, text)
     profile = get_user(user_id)
     t_low = text.lower()
 
-    # 3. Если пользователь написал «ИП» или спрашивает про открытие ИП — показываем варианты по ИП
+    # 3. Если пользователь написал «ИП» — открываем лаконичный хаб по ИП
     if t_low in ["ип", "открыть ип", "про ип", "все об ип", "всё об ип"]:
         await send_ip_hub_screen(message, user_id)
         return
 
-    # 4. Перехват запроса на создание напоминания
+    # 4. Перехват запроса на напоминание о налоге
     if any(w in t_low for w in ["напомни", "напоминание", "срок уплаты"]):
-        if profile["tax_regime"] == "Не указан" and "налог" in t_low:
-            USER_MENU_STATE[user_id] = {
-                "1": ("tax", "1"),
-                "2": ("tax", "2"),
-                "3": ("tax", "3")
-            }
-            await message.answer(
-                "Чтобы я настроил точное напоминание о сроках уплаты налогов, уточните ваш режим налогообложения "
-                "(нажмите кнопку или отправьте цифру **1–3** в чат):",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [
-                        InlineKeyboardButton(text="1. УСН", callback_data="tax_1"),
-                        InlineKeyboardButton(text="2. НПД (Самозанятый)", callback_data="tax_2")
-                    ],
-                    [InlineKeyboardButton(text="3. Патент (ПСН)", callback_data="tax_3")]
-                ]),
-                parse_mode="Markdown"
-            )
+        if "налог" in t_low or "взнос" in t_low or "усн" in t_low or "нпд" in t_low or "патент" in t_low:
+            await send_tax_reminders_menu(message, user_id)
             return
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
@@ -923,30 +863,28 @@ async def handle_question(message: Message):
                 (user_id, f"Задача из чата: {text[:50]}", "once")
             )
         await message.answer(
-            f"✅ Я создал напоминание по вашему запросу (Режим: **{profile['tax_regime']}**).\n"
+            f"✅ Я создал напоминание по вашему запросу.\n"
             "Управлять частотой или отключить его можно через `/reminders`, "
             "а проверить мгновенную отправку — через `/demo_push`.",
             parse_mode="Markdown"
         )
         return
 
-    # 5. ПОИСК ПО КЛЮЧЕВЫМ СЛОВАМ (предлагает варианты, где фигурирует слово)
+    # 5. ПОИСК ПО КЛЮЧЕВЫМ СЛОВАМ (без цифр в кнопках)
     matches = search_by_keyword(text)
     if len(matches) >= 2 and len(text.split()) <= 4:
-        USER_MENU_STATE[user_id] = {}
         buttons = []
-        lines = [f"🔎 **По запросу «{text}» найдено несколько материалов в «Альфа-Курсе»:**\n"]
-        for idx, item in enumerate(matches[:5], start=1):
+        lines = [f"🔎 **По запросу «{text}» найдены материалы в «Альфа-Курсе»:**\n"]
+        for item in matches[:5]:
             badge = "🎓 [Платный курс]" if item["is_paid"] else "📖 [Бесплатно]"
-            lines.append(f"**{idx}.** {badge} {item['title']}\n_{item['summary']}_\n")
-            USER_MENU_STATE[user_id][str(idx)] = ("mat", item["id"])
-            buttons.append([InlineKeyboardButton(text=f"{idx}. {item['title'][:38]}...", callback_data=f"mat_{item['id']}")])
+            lines.append(f"• {badge} **{item['title']}**\n_{item['summary']}_\n")
+            buttons.append([InlineKeyboardButton(text=f"📖 {item['title'][:40]}...", callback_data=f"mat_{item['id']}")])
 
-        next_num = str(len(matches[:5]) + 1)
-        USER_MENU_STATE[user_id][next_num] = ("nav", "ip_hub")
-        buttons.append([InlineKeyboardButton(text=f"{next_num}. 🏢 Раздел «Всё об ИП с нуля»", callback_data="nav_ip_hub")])
+        if any(w in t_low for w in ["налог", "усн", "нпд", "патент", "взнос"]):
+            buttons.append([InlineKeyboardButton(text="🔔 Напомнить по конкретному налогу", callback_data="nav_tax_reminders")])
+        buttons.append([InlineKeyboardButton(text="🏢 Раздел «Всё об ИП с нуля»", callback_data="nav_ip_hub")])
 
-        lines.append(f"👇 **Выберите нужный вариант кнопкой или отправьте цифру (1–{next_num}) в чат:**")
+        lines.append("👇 **Выберите подходящий материал кнопкой ниже:**")
         await message.answer(
             "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
@@ -954,17 +892,17 @@ async def handle_question(message: Message):
         )
         return
 
-    # 6. Обращение к YandexGPT (для развернутых вопросов, если подключены ключи)
+    # 6. Обращение к YandexGPT (для развернутых вопросов)
     system_prompt = (
         "Ты — ИИ-помощник образовательной платформы «Альфа-Курс» в Telegram.\n"
         f"Профиль предпринимателя: Стадия={profile['stage']}, Налоги={profile['tax_regime']}, Текущий фокус={profile['goal']}.\n"
         "ПРАВИЛА:\n"
-        "1. Отвечай ТОЛЬКО на основе предоставленной ниже базы знаний.\n"
-        "2. Если вопрос слишком широкий или неясный — задай 1-2 конкретных уточняющих вопроса.\n"
-        "3. Если ответа в базе нет — честно скажи об этом и предложи ближайшую тему из каталога.\n"
+        "1. Отвечай кратко, просто и ТОЛЬКО на основе предоставленной ниже базы знаний.\n"
+        "2. Не используй нумерованные списки для вариантов меню.\n"
+        "3. Если вопрос слишком широкий или неясный — задай 1-2 конкретных уточняющих вопроса.\n"
         "4. СТРОГОЕ ОГРАНИЧЕНИЕ: Для ПЛАТНЫХ курсов никогда не раскрывай внутреннее содержание — "
-        "кратко объясни пользу и дай ссылку.\n"
-        "5. В конце ответа всегда предлагай понятный следующий шаг.\n\n"
+        "кратко объясни пользу и предложи узнать подробнее по ссылке на «Альфа-Курс».\n"
+        "5. В конце ответа всегда предлагай понятный следующий шаг и ссылку на «Альфа-Курс».\n\n"
         f"БАЗА ЗНАНИЙ:\n{build_safe_context()}"
     )
 
@@ -973,28 +911,23 @@ async def handle_question(message: Message):
         await message.answer(yandex_answer, parse_mode="Markdown")
         return
 
-    # 7. Если найден ровно 1 точный материал в базе — сразу показываем его карточку
+    # 7. Если найден 1 точный материал — показываем его
     if len(matches) == 1:
         await send_material_card(message, user_id, matches[0]["id"])
         return
 
-    # 8. Если ничего не найдено или вопрос неоднозначный
-    USER_MENU_STATE[user_id] = {
-        "1": ("nav", "ip_hub"),
-        "2": ("mat", "mat_ip_taxes"),
-        "3": ("mat", "mat_mp_paid"),
-        "4": ("nav", "start")
-    }
+    # 8. Если точного совпадения нет
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1. 🏢 Всё об ИП: открытие с нуля и гид", callback_data="nav_ip_hub")],
-        [InlineKeyboardButton(text="2. 📊 Выбор налогового режима (УСН, НПД, Патент)", callback_data="mat_mat_ip_taxes")],
-        [InlineKeyboardButton(text="3. 🛍 Выход на маркетплейсы и юнит-экономика", callback_data="mat_mat_mp_paid")],
-        [InlineKeyboardButton(text="4. 🏠 В главное меню", callback_data="nav_start")]
+        [InlineKeyboardButton(text="🏢 Всё об ИП: открытие с нуля и гид", callback_data="nav_ip_hub")],
+        [InlineKeyboardButton(text="📊 Выбор налогового режима", callback_data="mat_mat_ip_taxes")],
+        [InlineKeyboardButton(text="🔔 Напомнить по конкретному налогу", callback_data="nav_tax_reminders")],
+        [InlineKeyboardButton(text="🛍 Выход на маркетплейсы и юнит-экономика", callback_data="mat_mat_mp_paid")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
     ])
     await message.answer(
         f"В базе знаний «Альфа-Курса» нет точного совпадения по запросу «{text}».\n\n"
         "💡 **Попробуйте написать ключевое слово** (например: `ИП`, `налоги`, `взносы`, `касса`, `маркетплейс`) "
-        "или выберите одну из популярных тем ниже (кнопкой или цифрой **1–4**):",
+        "или выберите одну из популярных тем ниже:",
         reply_markup=kb,
         parse_mode="Markdown"
     )
