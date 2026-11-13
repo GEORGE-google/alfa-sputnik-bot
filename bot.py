@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta
 import aiohttp
@@ -24,8 +25,10 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
-# Пользователи, которые сейчас вводят собственный фокус текстом
+# Состояния ожидания текстового ввода от пользователя
 AWAITING_CUSTOM_GOAL = set()
+USER_CALC_MODE: dict[int, str] = {}   # user_id -> 'usn6' | 'margin' | 'bep'
+TAX_QUIZ_STATE: dict[int, dict] = {}  # user_id -> {'income': ..., 'staff': ...}
 
 # Хранилище ID сообщений для очистки чата по команде /start
 CHAT_HISTORY_IDS: dict[int, set[int]] = {}
@@ -45,7 +48,6 @@ async def send_and_track(msg: Message, text: str, **kwargs):
 async def clear_user_chat(chat_id: int, current_msg_id: int):
     """Удаляет предыдущие сообщения в чате при вводе /start."""
     ids_to_delete = set(CHAT_HISTORY_IDS.get(chat_id, set()))
-    # Дополнительно захватываем последние 40 ID сообщений на случай перезапуска бота
     for mid in range(max(1, current_msg_id - 40), current_msg_id + 1):
         ids_to_delete.add(mid)
 
@@ -53,7 +55,7 @@ async def clear_user_chat(chat_id: int, current_msg_id: int):
     await asyncio.gather(*tasks, return_exceptions=True)
     CHAT_HISTORY_IDS[chat_id] = set()
 
-# --- СПРАВОЧНИКИ (короткие коды для callback_data) ---
+# --- СПРАВОЧНИКИ ---
 STAGE_MAP = {
     "1": "Планирую открыть дело",
     "2": "Действующий микробизнес",
@@ -76,7 +78,6 @@ GOAL_MAP = {
     "5": "Систематизация и найм команды"
 }
 
-# Справочник напоминаний по конкретным налогам
 SPECIFIC_TAX_REMINDERS = {
     "usn": {
         "name": "УСН (авансы и годовой налог)",
@@ -144,7 +145,7 @@ CATALOG = [
             "• **УСН «Доходы минус расходы» (15%):** выгоден, если подтвержденные расходы превышают 60-70% выручки.\n"
             "• **Патент (ПСН):** фиксированный налог для розницы, услуг и общепита (до 60 млн ₽ и до 15 сотрудников).\n"
             "• **АУСН (8% или 20%):** налог рассчитывается автоматически по счету, без деклараций (уплата до 25 числа).\n\n"
-            "🔔 *Ниже вы можете сразу включить напоминание по вашему конкретному налогу или изучить подробный разбор на «Альфа-Курсе».*"
+            "🔔 *Ниже вы можете сразу включить напоминание по вашему конкретному налогу или подобрать режим за 3 секунды.*"
         ),
         "url": "https://kurs.alfabank.ru/catalog?type=courses&utm_source=tg_bot&utm_medium=ip_taxes"
     },
@@ -206,7 +207,7 @@ CATALOG = [
     }
 ]
 
-# --- БАЗА ДАННЫХ (Профили и Напоминания) ---
+# --- БАЗА ДАННЫХ (Профили, Напоминания, Изученные материалы) ---
 DB_PATH = "sputnik.db"
 
 def init_db():
@@ -228,6 +229,14 @@ def init_db():
                 active INTEGER DEFAULT 1
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS completed_materials (
+                user_id INTEGER,
+                mat_id TEXT,
+                completed_at TEXT,
+                PRIMARY KEY (user_id, mat_id)
+            )
+        """)
 
 def get_user(user_id: int) -> dict:
     with sqlite3.connect(DB_PATH) as conn:
@@ -242,6 +251,43 @@ def update_user(user_id: int, field: str, value: str):
     get_user(user_id)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
+
+def mark_material_done(user_id: int, mat_id: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO completed_materials (user_id, mat_id, completed_at) VALUES (?, ?, ?)",
+            (user_id, mat_id, datetime.now().isoformat())
+        )
+
+def get_completed_materials(user_id: int) -> set[str]:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("SELECT mat_id FROM completed_materials WHERE user_id = ?", (user_id,))
+        return {r[0] for r in cur.fetchall()}
+
+def get_ordered_route_for_user(user_id: int) -> list[dict]:
+    """Строит персональный порядок маршрута в зависимости от стадии и фокуса пользователя."""
+    u = get_user(user_id)
+    stage = u["stage"]
+    goal = u["goal"]
+
+    if "Развиваю" in stage or "команд" in goal.lower():
+        order = ["mat_sales_paid", "mat_mp_paid", "mat_ip_kassa", "mat_ip_vznosy", "mat_ip_taxes", "mat_ip_start"]
+    elif "микробизнес" in stage or "маркетплейс" in goal.lower():
+        order = ["mat_ip_vznosy", "mat_ip_kassa", "mat_mp_paid", "mat_ip_taxes", "mat_sales_paid", "mat_ip_start"]
+    else:
+        order = ["mat_ip_start", "mat_ip_taxes", "mat_ip_vznosy", "mat_ip_kassa", "mat_mp_paid", "mat_sales_paid"]
+
+    id_map = {item["id"]: item for item in CATALOG}
+    return [id_map[mid] for mid in order if mid in id_map]
+
+def get_next_recommended_material(user_id: int) -> dict | None:
+    """Находит следующий неизученный материал по маршруту пользователя."""
+    completed = get_completed_materials(user_id)
+    route = get_ordered_route_for_user(user_id)
+    for item in route:
+        if item["id"] not in completed:
+            return item
+    return None
 
 def build_safe_context() -> str:
     """Формирует контекст для YandexGPT: для платных курсов скрывает full_text (Ограничение 06)."""
@@ -259,11 +305,12 @@ def build_safe_context() -> str:
             )
     return "\n\n".join(blocks)
 
-# --- ПОИСК ПО КЛЮЧЕВЫМ СЛОВАМ ---
-def search_by_keyword(query: str) -> list[dict]:
+# --- ПОИСК ПО КЛЮЧЕВЫМ СЛОВАМ (неизученные выше) ---
+def search_by_keyword(query: str, user_id: int | None = None) -> list[dict]:
     q_words = [w.strip(".,!?\"'()") for w in query.lower().split() if len(w.strip(".,!?\"'()")) >= 2]
     if not q_words:
         return []
+    completed = get_completed_materials(user_id) if user_id else set()
     results = []
     for item in CATALOG:
         searchable = (
@@ -272,9 +319,10 @@ def search_by_keyword(query: str) -> list[dict]:
         ).lower()
         score = sum(2 if w in item.get("keywords", []) or w in item["title"].lower() else 1 for w in q_words if w in searchable)
         if score > 0:
-            results.append((score, item))
-    results.sort(key=lambda x: x[0], reverse=True)
-    return [r[1] for r in results]
+            is_unseen = 0 if item["id"] in completed else 1
+            results.append((is_unseen, score, item))
+    results.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [r[2] for r in results]
 
 def get_material_by_id(mat_id: str) -> dict | None:
     for item in CATALOG:
@@ -334,13 +382,18 @@ def auto_extract_profile(user_id: int, text: str):
     elif any(w in t for w in ["налог", "взносы", "декларац", "отчетност"]):
         update_user(user_id, "goal", "Налоги, учет и отчетность")
 
-# --- КЛАВИАТУРЫ (БЕЗ ЦИФР И БЕЗ ДЛИННЫХ ТИРЕ) ---
+# --- КЛАВИАТУРЫ ---
 def start_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Планирую открыть дело", callback_data="stage_1")],
         [InlineKeyboardButton(text="🛠 Решаю задачу в микробизнесе", callback_data="stage_2")],
         [InlineKeyboardButton(text="📈 Хочу системно развить бизнес", callback_data="stage_3")],
         [InlineKeyboardButton(text="🏢 Всё об ИП: открытие с нуля и налоги", callback_data="nav_ip_hub")],
+        [
+            InlineKeyboardButton(text="⚡ Подбор налога за 3 сек", callback_data="nav_tax_quiz"),
+            InlineKeyboardButton(text="🧮 Быстрые расчеты", callback_data="nav_calc")
+        ],
+        [InlineKeyboardButton(text="🗺 Мой маршрут обучения", callback_data="nav_route")],
         [
             InlineKeyboardButton(text="📋 Мой профиль", callback_data="nav_profile"),
             InlineKeyboardButton(text="⏰ Напоминания", callback_data="nav_reminders")
@@ -352,7 +405,9 @@ def profile_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎯 Изменить текущий фокус", callback_data="submenu_goal")],
         [InlineKeyboardButton(text="💼 Изменить налоговый режим", callback_data="submenu_tax")],
+        [InlineKeyboardButton(text="⚡ Подобрать налог за 3 сек (Квиз)", callback_data="nav_tax_quiz")],
         [InlineKeyboardButton(text="🚀 Изменить стадию бизнеса", callback_data="submenu_stage")],
+        [InlineKeyboardButton(text="🗺 Мой маршрут обучения", callback_data="nav_route")],
         [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
     ])
 
@@ -394,11 +449,12 @@ def stage_selection_kb():
 def ip_hub_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Как открыть ИП с нуля за 0 ₽", callback_data="mat_mat_ip_start")],
-        [InlineKeyboardButton(text="📊 Налоги для ИП: выбор режима", callback_data="mat_mat_ip_taxes")],
+        [InlineKeyboardButton(text="⚡ Калькулятор налогового режима за 3 сек", callback_data="nav_tax_quiz")],
+        [InlineKeyboardButton(text="📊 Налоги для ИП: сравнение режимов", callback_data="mat_mat_ip_taxes")],
         [InlineKeyboardButton(text="🔔 Напомнить по конкретному налогу", callback_data="nav_tax_reminders")],
         [InlineKeyboardButton(text="💳 Страховые взносы ИП и отчетность", callback_data="mat_mat_ip_vznosy")],
         [InlineKeyboardButton(text="🧾 Счет, онлайн-касса и вывод денег", callback_data="mat_mat_ip_kassa")],
-        [InlineKeyboardButton(text="🎓 Курс: Выход ИП на маркетплейсы", callback_data="mat_mat_mp_paid")],
+        [InlineKeyboardButton(text="🧮 Быстрые расчеты (УСН, маржа, ТБУ)", callback_data="nav_calc")],
         [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
     ])
 
@@ -413,6 +469,15 @@ def specific_tax_reminders_kb():
         [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
     ])
 
+def calc_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Налог УСН 6% и вычет взносов ИП", callback_data="calc_usn6")],
+        [InlineKeyboardButton(text="📦 Маржинальность и прибыль с товара", callback_data="calc_margin")],
+        [InlineKeyboardButton(text="⚖️ Точка безубыточности (ТБУ)", callback_data="calc_bep")],
+        [InlineKeyboardButton(text="⚡ Подбор налогового режима за 3 сек", callback_data="nav_tax_quiz")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
+    ])
+
 def reminder_control_kb(rem_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -423,16 +488,17 @@ def reminder_control_kb(rem_id: int):
         [InlineKeyboardButton(text="🔕 Отключить напоминание", callback_data=f"freq_{rem_id}_off")]
     ])
 
-# --- ЭКРАНЫ БОТА ---
+# --- ОСНОВНЫЕ ЭКРАНЫ БОТА ---
 async def send_start_screen(msg: Message, user_id: int):
     AWAITING_CUSTOM_GOAL.discard(user_id)
+    USER_CALC_MODE.pop(user_id, None)
     get_user(user_id)
     await send_and_track(
         msg,
         "Привет! Я **Альфа-Спутник** - ваш ИИ-помощник по платформе «Альфа-Курс».\n\n"
-        "• Ищу материалы по **ключевым словам** (напишите, например, `ИП`, `налоги` или `маркетплейс`)\n"
-        "• Подбираю короткие инструкции и курсы под вашу задачу\n"
-        "• Настраиваю напоминания об учебе и по конкретным налогам\n\n"
+        "• Ищу материалы по **ключевым словам** (напишите `ИП`, `налоги` или `маркетплейс`)\n"
+        "• Подбираю **налоговый режим за 3 секунды** и считаю **налоги, маржу и ТБУ** прямо в чате\n"
+        "• Веду ваш **маршрут обучения** со статусом «Изучено» и напоминаю о налогах\n\n"
         "👇 **Выберите нужный раздел или напишите свой вопрос в чат:**",
         reply_markup=start_kb(),
         parse_mode="Markdown"
@@ -447,18 +513,17 @@ async def send_stage_response(msg: Message, user_id: int, stage_code: str):
         update_user(user_id, "goal", "Открытие ИП и регистрация бизнеса")
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📝 Как открыть ИП с нуля и без госпошлины", callback_data="mat_mat_ip_start")],
-            [InlineKeyboardButton(text="📊 Сравнение налогов для старта (УСН / НПД)", callback_data="mat_mat_ip_taxes")],
-            [InlineKeyboardButton(text="🔔 Настроить напоминание по налогу", callback_data="nav_tax_reminders")],
-            [InlineKeyboardButton(text="🏢 Открыть раздел «Всё об ИП»", callback_data="nav_ip_hub")],
+            [InlineKeyboardButton(text="⚡ Подобрать налоговый режим за 3 сек", callback_data="nav_tax_quiz")],
+            [InlineKeyboardButton(text="🗺 Открыть мой маршрут обучения", callback_data="nav_route")],
             [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
         ])
         await send_and_track(
             msg,
             f"🚀 **Стадия «{stage_title}» сохранена в профиль.**\n\n"
             "Для быстрого старта без штрафов рекомендуем:\n"
-            "• Определить форму бизнеса и коды ОКВЭД\n"
-            "• Сразу выбрать выгодный налоговый режим (УСН или НПД)\n"
-            "• Подать заявку онлайн без уплаты госпошлины 800 ₽\n\n"
+            "• Подобрать налоговый режим за 3 секунды в нашем экспресс-калькуляторе\n"
+            "• Подать заявку на открытие ИП онлайн без уплаты госпошлины 800 ₽\n"
+            "• Пройти базовый маршрут начинающего предпринимателя\n\n"
             "👇 **С чего начнем?**",
             reply_markup=kb,
             parse_mode="Markdown"
@@ -467,20 +532,20 @@ async def send_stage_response(msg: Message, user_id: int, stage_code: str):
     elif stage_code == "2":
         update_user(user_id, "goal", "Налоги, учет и отчетность")
         kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧮 Быстрые расчеты: УСН 6%, маржа и ТБУ", callback_data="nav_calc")],
             [InlineKeyboardButton(text="💳 Страховые взносы ИП и уменьшение налога", callback_data="mat_mat_ip_vznosy")],
             [InlineKeyboardButton(text="🔔 Напомнить по конкретному налогу", callback_data="nav_tax_reminders")],
-            [InlineKeyboardButton(text="🧾 Онлайн-касса (54-ФЗ), СБП и вывод денег", callback_data="mat_mat_ip_kassa")],
-            [InlineKeyboardButton(text="🛍 Курс: Юнит-экономика на маркетплейсах", callback_data="mat_mat_mp_paid")],
+            [InlineKeyboardButton(text="🗺 Открыть мой маршрут обучения", callback_data="nav_route")],
             [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
         ])
         await send_and_track(
             msg,
             f"🛠 **Стадия «{stage_title}» сохранена.**\n\n"
             "Подборка практических решений для действующего микробизнеса:\n"
-            "• Как уменьшить налог УСН или Патент за счет взносов ИП\n"
-            "• Как настроить напоминание по вашему конкретному налогу\n"
-            "• Как работать с кассой и считать маржинальность на маркетплейсах\n\n"
-            "👇 **Выберите нужную тему:**",
+            "• Посчитать вычет взносов ИП, маржинальность и точку безубыточности прямо в чате\n"
+            "• Настроить напоминание по вашему конкретному налогу\n"
+            "• Изучить материалы по кассе и юнит-экономике в персональном маршруте\n\n"
+            "👇 **Выберите нужный инструмент:**",
             reply_markup=kb,
             parse_mode="Markdown"
         )
@@ -490,7 +555,8 @@ async def send_stage_response(msg: Message, user_id: int, stage_code: str):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="👥 Курс: Построение отдела продаж и найм", callback_data="mat_mat_sales_paid")],
             [InlineKeyboardButton(text="📈 Курс: Масштабирование на маркетплейсах", callback_data="mat_mat_mp_paid")],
-            [InlineKeyboardButton(text="🎯 Настроить свой фокус развития", callback_data="submenu_goal")],
+            [InlineKeyboardButton(text="🧮 Посчитать маржинальность и ТБУ в чате", callback_data="nav_calc")],
+            [InlineKeyboardButton(text="🗺 Открыть мой маршрут обучения", callback_data="nav_route")],
             [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
         ])
         await send_and_track(
@@ -505,9 +571,360 @@ async def send_stage_response(msg: Message, user_id: int, stage_code: str):
             parse_mode="Markdown"
         )
 
+# --- 1. МАРШРУТ ОБУЧЕНИЯ И СТАТУС «ИЗУЧЕНО» ---
+async def send_learning_route_screen(msg: Message, user_id: int):
+    """Показывает персональный маршрут обучения со статусами «Изучено» и следующим шагом."""
+    AWAITING_CUSTOM_GOAL.discard(user_id)
+    USER_CALC_MODE.pop(user_id, None)
+
+    u = get_user(user_id)
+    completed = get_completed_materials(user_id)
+    route = get_ordered_route_for_user(user_id)
+    next_item = get_next_recommended_material(user_id)
+
+    total = len(route)
+    done_cnt = len(completed)
+
+    lines = [
+        "🗺 **Ваш персональный маршрут обучения на «Альфа-Курсе»**\n",
+        f"• **Профиль:** {u['stage']} | Фокус: {u['goal']}",
+        f"• **Прогресс:** изучено **{done_cnt} из {total}** материалов\n"
+    ]
+
+    buttons = []
+    for item in route:
+        is_done = item["id"] in completed
+        is_next = next_item and item["id"] == next_item["id"]
+        if is_done:
+            status_icon = "✅ [Изучено]"
+            btn_prefix = "✅"
+        elif is_next:
+            status_icon = "👉 **[Следующий шаг]**"
+            btn_prefix = "👉"
+        else:
+            status_icon = "⏳ [В плане]"
+            btn_prefix = "📖"
+
+        lines.append(f"{status_icon} {item['title']}")
+        buttons.append([InlineKeyboardButton(text=f"{btn_prefix} {item['title'][:38]}...", callback_data=f"mat_{item['id']}")])
+
+    if next_item:
+        lines.append(f"\n💡 **Рекомендуемый следующий шаг:** «{next_item['title']}»")
+    else:
+        lines.append("\n🏆 **Поздравляем! Вы изучили все базовые материалы маршрута.**")
+
+    buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")])
+
+    await send_and_track(
+        msg,
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+
+# --- 2. КАЛЬКУЛЯТОР НАЛОГОВОГО РЕЖИМА ЗА 3 СЕКУНДЫ ---
+async def send_tax_quiz_start(msg: Message, user_id: int):
+    """Шаг 1 из 3: выбор годового дохода."""
+    AWAITING_CUSTOM_GOAL.discard(user_id)
+    USER_CALC_MODE.pop(user_id, None)
+    TAX_QUIZ_STATE[user_id] = {}
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="До 2,4 млн ₽ в год (до 200 тыс. ₽/мес)", callback_data="tquiz_inc_low")],
+        [InlineKeyboardButton(text="От 2,4 до 60 млн ₽ в год", callback_data="tquiz_inc_mid")],
+        [InlineKeyboardButton(text="Свыше 60 млн ₽ в год", callback_data="tquiz_inc_high")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
+    ])
+    await send_and_track(
+        msg,
+        "⚡ **Подбор налогового режима за 3 секунды (Вопрос 1 из 3)**\n\n"
+        "Какой у вас планируемый или текущий **годовой доход (выручка)**?",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("tquiz_inc_"))
+async def cb_tax_quiz_step2(call: CallbackQuery):
+    """Шаг 2 из 3: наличие сотрудников."""
+    uid = call.from_user.id
+    inc = call.data.replace("tquiz_inc_", "")
+    TAX_QUIZ_STATE[uid] = {"income": inc}
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Работаю один (без сотрудников)", callback_data="tquiz_staff_none")],
+        [InlineKeyboardButton(text="До 5 сотрудников", callback_data="tquiz_staff_up5")],
+        [InlineKeyboardButton(text="От 6 до 15 сотрудников", callback_data="tquiz_staff_up15")],
+        [InlineKeyboardButton(text="Более 15 сотрудников", callback_data="tquiz_staff_many")],
+        [InlineKeyboardButton(text="⬅️ Начать заново", callback_data="nav_tax_quiz")]
+    ])
+    await call.message.edit_text(
+        "⚡ **Подбор налогового режима за 3 секунды (Вопрос 2 из 3)**\n\n"
+        "Планируете ли вы **нанимать сотрудников** по трудовым договорам?",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("tquiz_staff_"))
+async def cb_tax_quiz_step3(call: CallbackQuery):
+    """Шаг 3 из 3: доля подтвержденных расходов."""
+    uid = call.from_user.id
+    staff = call.data.replace("tquiz_staff_", "")
+    if uid not in TAX_QUIZ_STATE:
+        TAX_QUIZ_STATE[uid] = {"income": "mid"}
+    TAX_QUIZ_STATE[uid]["staff"] = staff
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Мало расходов (менее 60% - услуги, IT, консультации)", callback_data="tquiz_exp_low")],
+        [InlineKeyboardButton(text="Много расходов (более 60% - торговля, закупка, общепит)", callback_data="tquiz_exp_high")],
+        [InlineKeyboardButton(text="⬅️ Начать заново", callback_data="nav_tax_quiz")]
+    ])
+    await call.message.edit_text(
+        "⚡ **Подбор налогового режима за 3 секунды (Вопрос 3 из 3)**\n\n"
+        "Какая у вашего бизнеса **доля документально подтвержденных расходов** от выручки?",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("tquiz_exp_"))
+async def cb_tax_quiz_result(call: CallbackQuery):
+    """Мгновенный результат подбора налогового режима + сохранение в профиль."""
+    uid = call.from_user.id
+    exp = call.data.replace("tquiz_exp_", "")
+    state = TAX_QUIZ_STATE.get(uid, {"income": "mid", "staff": "none"})
+    inc = state.get("income", "mid")
+    staff = state.get("staff", "none")
+
+    if inc == "low" and staff == "none" and exp == "low":
+        best_regime = "НПД (Самозанятый)"
+        rem_key = "npd"
+        explanation = (
+            "• **Ставка:** 4% с физлиц и 6% с ИП/юрлиц.\n"
+            "• **Почему подходит:** при доходе до 2,4 млн ₽ без сотрудников вы не платите обязательные фиксированные взносы ИП и не сдаете декларации.\n"
+            "• **Альтернатива для роста:** ИП на УСН «Доходы» 6%."
+        )
+    elif exp == "low":
+        best_regime = "УСН (Упрощенная система)"
+        rem_key = "usn"
+        extra_note = " Также рассмотрите **Патент (ПСН)** или **АУСН (8%)**, если у вас до 5 сотрудников." if inc != "high" and staff in ("none", "up5") else ""
+        explanation = (
+            "• **Рекомендуемый вариант:** **УСН «Доходы» (6%)**.\n"
+            "• **Почему подходит:** при небольшой доле расходов выгоднее платить 6% со всей выручки и уменьшать налог до 50-100% за счет страховых взносов ИП.\n"
+            f"• **Дополнительно:**{extra_note if extra_note else ' подходит для масштабирования с выручкой свыше 60 млн ₽.'}"
+        )
+    else:
+        best_regime = "УСН (Упрощенная система)"
+        rem_key = "usn"
+        explanation = (
+            "• **Рекомендуемый вариант:** **УСН «Доходы минус расходы» (15%)** (или **Патент** для розницы/услуг до 60 млн ₽).\n"
+            "• **Почему подходит:** когда закупка товара, аренда и логистика превышают 60-70% оборота, налог с разницы (доходы минус расходы) экономит до половины налоговой нагрузки."
+        )
+
+    update_user(uid, "tax_regime", best_regime)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔔 Включить напоминание по {best_regime[:12]}", callback_data=f"addtaxrem_{rem_key}")],
+        [InlineKeyboardButton(text="🧮 Посчитать сумму налога в чате", callback_data="calc_usn6")],
+        [InlineKeyboardButton(text="📖 Подробнее о налогах на «Альфа-Курсе»", callback_data="mat_mat_ip_taxes")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
+    ])
+
+    await call.message.edit_text(
+        f"✅ **Результат подбора: {best_regime}**\n"
+        f"_(Режим автоматически сохранен в ваш профиль!)_\n\n"
+        f"{explanation}\n\n"
+        f"👇 **Выберите следующий шаг:**",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+    await call.answer("Режим подобран!")
+
+# --- 3. РАЗДЕЛ С БЫСТРЫМИ РАСЧЕТАМИ ПРЯМО В ЧАТЕ ---
+async def send_calc_menu_screen(msg: Message, user_id: int):
+    AWAITING_CUSTOM_GOAL.discard(user_id)
+    USER_CALC_MODE.pop(user_id, None)
+    await send_and_track(
+        msg,
+        "🧮 **Быстрые финансовые расчеты прямо в чате**\n\n"
+        "Выберите нужный калькулятор - вы сможете отправить свои числа в чат или нажать кнопку мгновенного примера:",
+        reply_markup=calc_menu_kb(),
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("calc_"))
+async def cb_select_calculator(call: CallbackQuery):
+    uid = call.from_user.id
+    mode = call.data.replace("calc_", "")
+
+    if mode == "demo_usn6":
+        await process_calculation_input(call.message, uid, "1200000 53658", mode_override="usn6")
+        await call.answer()
+        return
+    elif mode == "demo_margin":
+        await process_calculation_input(call.message, uid, "2500 1400", mode_override="margin")
+        await call.answer()
+        return
+    elif mode == "demo_bep":
+        await process_calculation_input(call.message, uid, "150000 3000 1800", mode_override="bep")
+        await call.answer()
+        return
+
+    USER_CALC_MODE[uid] = mode
+
+    if mode == "usn6":
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚡ Показать пример (Доход 1 200 000 ₽, взносы 53 658 ₽)", callback_data="calc_demo_usn6")],
+            [InlineKeyboardButton(text="⬅️ К списку расчетов", callback_data="nav_calc")]
+        ])
+        await send_and_track(
+            call.message,
+            "💰 **Калькулятор УСН 6% и вычета взносов ИП за год**\n\n"
+            "Отправьте в чат **2 числа через пробел**:\n"
+            "`Годовой_доход Уплаченные_взносы`\n"
+            "*(Например: `1200000 53658`)*\n\n"
+            "Я рассчитаю налог 6%, дополнительный взнос 1% свыше 300 000 ₽ и итоговую сумму к доплате с учетом вычета:",
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
+    elif mode == "margin":
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚡ Показать пример (Цена 2 500 ₽, Расходы 1 400 ₽)", callback_data="calc_demo_margin")],
+            [InlineKeyboardButton(text="⬅️ К списку расчетов", callback_data="nav_calc")]
+        ])
+        await send_and_track(
+            call.message,
+            "📦 **Калькулятор маржинальности и наценки товара**\n\n"
+            "Отправьте в чат **2 числа через пробел**:\n"
+            "`Цена_продажи Себестоимость_с_расходами`\n"
+            "*(Например: `2500 1400`)*\n\n"
+            "Я рассчитаю чистую прибыль с единицы, маржинальность и торговую наценку:",
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
+    elif mode == "bep":
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚡ Показать пример (Аренда/ФОТ 150 000, Чек 3 000, Себест. 1 800)", callback_data="calc_demo_bep")],
+            [InlineKeyboardButton(text="⬅️ К списку расчетов", callback_data="nav_calc")]
+        ])
+        await send_and_track(
+            call.message,
+            "⚖️ **Калькулятор точки безубыточности (ТБУ) на месяц**\n\n"
+            "Отправьте в чат **3 числа через пробел**:\n"
+            "`Постоянные_расходы Средний_чек Переменные_расходы_на_1_продажу`\n"
+            "*(Например: `150000 3000 1800`)*\n\n"
+            "Я посчитаю, сколько продаж и на какую выручку нужно делать в месяц для выхода в ноль:",
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
+    await call.answer()
+
+async def process_calculation_input(msg: Message, user_id: int, text: str, mode_override: str | None = None) -> bool:
+    """Обрабатывает ввод чисел для выбранного калькулятора."""
+    mode = mode_override or USER_CALC_MODE.get(user_id)
+    if not mode:
+        return False
+
+    nums = [float(x.replace(",", ".")) for x in re.findall(r"\d+(?:[.,]\d+)?", text)]
+    if len(nums) < 2:
+        return False
+
+    USER_CALC_MODE.pop(user_id, None)
+
+    if mode == "usn6":
+        income = nums[0]
+        fixed_vznosy = nums[1]
+        tax_6 = income * 0.06
+        extra_1_percent = max(0.0, (income - 300_000.0) * 0.01)
+        total_deduction = fixed_vznosy + extra_1_percent
+        tax_to_pay = max(0.0, tax_6 - total_deduction)
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Подробнее о взносах ИП и вычете", callback_data="mat_mat_ip_vznosy")],
+            [InlineKeyboardButton(text="🔔 Включить напоминание по УСН", callback_data="addtaxrem_usn")],
+            [InlineKeyboardButton(text="🧮 Другой расчет", callback_data="nav_calc")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
+        ])
+        await send_and_track(
+            msg,
+            f"💰 **Расчет налога УСН 6% (для ИП без сотрудников):**\n\n"
+            f"• **Годовой доход:** {income:,.0f} ₽\n"
+            f"• **Налог УСН (6% до вычета):** {tax_6:,.0f} ₽\n"
+            f"• **Фиксированные взносы:** {fixed_vznosy:,.0f} ₽\n"
+            f"• **Доп. взнос 1% свыше 300 000 ₽:** {extra_1_percent:,.0f} ₽\n"
+            f"• **Всего взносов к вычету:** {total_deduction:,.0f} ₽\n\n"
+            f"✅ **Итого налог УСН к доплате:** **{tax_to_pay:,.0f} ₽**\n"
+            f"_(Налог уменьшен на сумму взносов на {min(tax_6, total_deduction):,.0f} ₽!)_",
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
+        return True
+
+    elif mode == "margin":
+        price = nums[0]
+        cost = nums[1]
+        profit = price - cost
+        margin = (profit / price * 100.0) if price > 0 else 0.0
+        markup = (profit / cost * 100.0) if cost > 0 else 0.0
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎓 Курс: Юнит-экономика на маркетплейсах", callback_data="mat_mat_mp_paid")],
+            [InlineKeyboardButton(text="🧮 Другой расчет", callback_data="nav_calc")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
+        ])
+        await send_and_track(
+            msg,
+            f"📦 **Расчет юнит-экономики и маржинальности:**\n\n"
+            f"• **Цена продажи:** {price:,.0f} ₽\n"
+            f"• **Себестоимость и расходы:** {cost:,.0f} ₽\n\n"
+            f"✅ **Прибыль с 1 единицы:** **{profit:,.0f} ₽**\n"
+            f"📊 **Маржинальность:** **{margin:.1f}%**\n"
+            f"📈 **Торговая наценка:** **{markup:.1f}%**\n\n"
+            f"💡 *Полные финансовые таблицы с учетом логистики, комиссий и возвратов доступны в практикуме на «Альфа-Курсе».*",
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
+        return True
+
+    elif mode == "bep":
+        if len(nums) < 3:
+            await send_and_track(msg, "Для расчета точки безубыточности введите 3 числа через пробел: `Постоянные_расходы Средний_чек Переменные_расходы` (например: `150000 3000 1800`).", parse_mode="Markdown")
+            USER_CALC_MODE[user_id] = "bep"
+            return True
+        fixed_costs, avg_check, var_cost = nums[0], nums[1], nums[2]
+        unit_margin = avg_check - var_cost
+        if unit_margin <= 0:
+            await send_and_track(msg, "⚠️ Средний чек должен быть больше переменных расходов на 1 продажу, иначе каждая продажа убыточна.")
+            return True
+        bep_units = int((fixed_costs / unit_margin) + 0.999)
+        bep_revenue = bep_units * avg_check
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎓 Курс: Система продаж и рост выручки", callback_data="mat_mat_sales_paid")],
+            [InlineKeyboardButton(text="🧮 Другой расчет", callback_data="nav_calc")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
+        ])
+        await send_and_track(
+            msg,
+            f"⚖️ **Расчет точки безубыточности (ТБУ) на месяц:**\n\n"
+            f"• **Постоянные расходы (аренда, ФОТ):** {fixed_costs:,.0f} ₽\n"
+            f"• **Средний чек:** {avg_check:,.0f} ₽\n"
+            f"• **Маржа с 1 продажи:** {unit_margin:,.0f} ₽\n\n"
+            f"✅ **Точка безубыточности в продажах:** **{bep_units} продаж в месяц** (около {max(1, round(bep_units / 30))} в день)\n"
+            f"💵 **Минимальная выручка для выхода в ноль:** **{bep_revenue:,.0f} ₽ / мес**\n\n"
+            f"💡 *Каждая продажа сверх {bep_units} шт. приносит чистую прибыль {unit_margin:,.0f} ₽.*",
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
+        return True
+
+    return False
+
+# --- ЭКРАН «ВСЁ ОБ ИП» И КАРТОЧКИ МАТЕРИАЛОВ ---
 async def send_ip_hub_screen(msg: Message, user_id: int):
     """Упрощенный и наглядный раздел «Всё об ИП» со ссылкой на Альфа-Курс."""
     AWAITING_CUSTOM_GOAL.discard(user_id)
+    USER_CALC_MODE.pop(user_id, None)
     await send_and_track(
         msg,
         "🏢 **Всё об ИП: быстрый старт и база «Альфа-Курса»**\n\n"
@@ -525,6 +942,7 @@ async def send_ip_hub_screen(msg: Message, user_id: int):
 async def send_tax_reminders_menu(msg: Message, user_id: int):
     """Меню выбора напоминания по конкретному налогу."""
     AWAITING_CUSTOM_GOAL.discard(user_id)
+    USER_CALC_MODE.pop(user_id, None)
     u = get_user(user_id)
     await send_and_track(
         msg,
@@ -536,56 +954,102 @@ async def send_tax_reminders_menu(msg: Message, user_id: int):
     )
 
 async def send_material_card(msg: Message, user_id: int, mat_id: str):
-    """Показывает карточку материала (с кнопкой напоминания по конкретному налогу в налоговых темах)."""
+    """Показывает карточку материала с кнопкой «Отметить как изученное» и маршрутом."""
     item = get_material_by_id(mat_id)
     if not item:
         await send_and_track(msg, "Материал не найден. Нажмите `/start` для возврата в меню.")
         return
 
+    completed = get_completed_materials(user_id)
+    is_done = mat_id in completed
     is_tax_topic = mat_id in ("mat_ip_taxes", "mat_ip_vznosy")
+
     buttons = [
         [InlineKeyboardButton(text="🔗 Узнать подробнее на «Альфа-Курсе»", url=item["url"])]
     ]
+    if is_done:
+        buttons.append([InlineKeyboardButton(text="☑️ Уже изучено (Перейти к маршруту)", callback_data="nav_route")])
+    else:
+        buttons.append([InlineKeyboardButton(text="✅ Отметить как изученное (+ Следующий шаг)", callback_data=f"done_{mat_id}")])
+
     if is_tax_topic:
         buttons.append([InlineKeyboardButton(text="🔔 Напомнить по конкретному налогу", callback_data="nav_tax_reminders")])
     else:
         buttons.append([InlineKeyboardButton(text="⏰ Напомнить изучить материал", callback_data="nav_reminders")])
 
-    buttons.append([InlineKeyboardButton(text="🏢 В раздел «Всё об ИП»", callback_data="nav_ip_hub")])
+    buttons.append([InlineKeyboardButton(text="🗺 Мой маршрут обучения", callback_data="nav_route")])
     buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    status_badge = "\n✅ *Статус: Изучено вами*" if is_done else ""
 
     if item["is_paid"]:
         await send_and_track(
             msg,
-            f"🎓 **Платный курс «Альфа-Курса»:**\n**«{item['title']}»**\n\n"
+            f"🎓 **Платный курс «Альфа-Курса»:**\n**«{item['title']}»**{status_badge}\n\n"
             f"• **Кому подойдет:** {item['target_stage']}\n"
             f"• **Чем полезен курс:** {item['summary']}\n\n"
             f"_🔒 Подробные уроки, видео и расчетные таблицы доступны после приобретения курса на платформе._\n\n"
-            f"👇 **Перейдите по ссылке ниже, чтобы узнать подробнее:**",
+            f"👇 **Перейдите по ссылке ниже или отметьте материал в маршруте:**",
             reply_markup=kb,
             parse_mode="Markdown"
         )
     else:
         await send_and_track(
             msg,
-            f"📖 **{item['title']}**\n\n"
+            f"📖 **{item['title']}**{status_badge}\n\n"
             f"{item['full_text']}\n\n"
-            f"👇 **Перейдите на «Альфа-Курс» по кнопке ниже, чтобы узнать подробнее:**",
+            f"👇 **Перейдите на «Альфа-Курс» по кнопке ниже или отметьте тему изученной:**",
             reply_markup=kb,
             parse_mode="Markdown"
         )
 
+@dp.callback_query(F.data.startswith("done_"))
+async def cb_mark_material_done(call: CallbackQuery):
+    """Отмечает материал изученным и сразу предлагает следующий шаг по маршруту."""
+    uid = call.from_user.id
+    mat_id = call.data.replace("done_", "", 1)
+    mark_material_done(uid, mat_id)
+
+    current_item = get_material_by_id(mat_id)
+    completed = get_completed_materials(uid)
+    next_item = get_next_recommended_material(uid)
+    total = len(CATALOG)
+
+    buttons = []
+    if next_item:
+        next_Info = f"👉 **Рекомендуемый следующий шаг:**\n**«{next_item['title']}»**\n_{next_item['summary']}_"
+        buttons.append([InlineKeyboardButton(text=f"👉 Перейти: {next_item['title'][:34]}...", callback_data=f"mat_{next_item['id']}")])
+    else:
+        next_Info = "🏆 **Вы полностью прошли все рекомендуемые материалы маршрута!**"
+
+    buttons.append([InlineKeyboardButton(text="🗺 Посмотреть весь маршрут обучения", callback_data="nav_route")])
+    buttons.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")])
+
+    title_str = current_item["title"] if current_item else mat_id
+    await send_and_track(
+        call.message,
+        f"✅ **Материал «{title_str}» отмечен как изученный!**\n"
+        f"📊 Ваш прогресс на платформе: **{len(completed)} из {total}** тем пройдено.\n\n"
+        f"{next_Info}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await call.answer("Отмечено как изученное!")
+
 async def send_profile_screen(msg: Message, user_id: int):
     AWAITING_CUSTOM_GOAL.discard(user_id)
+    USER_CALC_MODE.pop(user_id, None)
     u = get_user(user_id)
+    completed = get_completed_materials(user_id)
     await send_and_track(
         msg,
         f"📋 **Ваш профиль бизнеса:**\n"
         f"• **Стадия:** {u['stage']}\n"
         f"• **Налоговый режим:** {u['tax_regime']}\n"
-        f"• **Текущий фокус:** {u['goal']}\n\n"
-        f"_Я учитываю эти данные при подборе курсов и расчете дат налогов._\n"
+        f"• **Текущий фокус:** {u['goal']}\n"
+        f"• **Изучено материалов:** {len(completed)} из {len(CATALOG)}\n\n"
+        f"_Я учитываю эти данные при построении маршрута обучения и расчете дат налогов._\n"
         f"👇 **Выберите параметр, который хотите изменить:**",
         reply_markup=profile_kb(),
         parse_mode="Markdown"
@@ -593,22 +1057,25 @@ async def send_profile_screen(msg: Message, user_id: int):
 
 async def send_help_screen(msg: Message, user_id: int):
     AWAITING_CUSTOM_GOAL.discard(user_id)
+    USER_CALC_MODE.pop(user_id, None)
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗺 Мой маршрут обучения и статус «Изучено»", callback_data="nav_route")],
+        [InlineKeyboardButton(text="⚡ Подбор налогового режима за 3 сек", callback_data="nav_tax_quiz")],
+        [InlineKeyboardButton(text="🧮 Быстрые расчеты в чате (УСН, маржа, ТБУ)", callback_data="nav_calc")],
         [InlineKeyboardButton(text="🏢 Всё об ИП: открытие с нуля и гид", callback_data="nav_ip_hub")],
         [InlineKeyboardButton(text="🔔 Напомнить по конкретному налогу", callback_data="nav_tax_reminders")],
         [InlineKeyboardButton(text="📋 Открыть и настроить мой профиль", callback_data="nav_profile")],
-        [InlineKeyboardButton(text="⏰ Управление напоминаниями", callback_data="nav_reminders")],
         [InlineKeyboardButton(text="⚡ Тест пуш-уведомления (10 сек)", callback_data="nav_demo_push")],
         [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
     ])
     await send_and_track(
         msg,
         "❓ **Все функции бота «Альфа-Спутник»**\n\n"
-        "• **Поиск по ключевым словам и ИИ-ответы:** напишите слово (например, `ИП`, `налоги`, `взносы`, `касса`, `маркетплейс`) - бот предложит подходящие материалы из «Альфа-Курса».\n"
-        "• **Раздел «Всё об ИП» (`/ip`):** краткий гид по открытию ИП с нуля без госпошлины и прямые ссылки на «Альфа-Курс».\n"
-        "• **Напоминания по конкретному налогу:** выберите УСН, НПД, Патент, взносы ИП или АУСН, чтобы вовремя получать уведомления о сроках уплаты.\n"
-        "• **Профиль бизнеса (`/profile`):** настройка стадии бизнеса, налогового режима и вашего **Текущего фокуса**.\n"
-        "• **Демо-пуш (`/demo_push`):** проверка живого уведомления за 10 секунд.\n\n"
+        "• **Маршрут обучения (`/route`):** персональный трек материалов со статусом «✅ Изучено» и подсказкой следующего шага.\n"
+        "• **Калькулятор налога за 3 сек (`/tax_quiz`):** подбор оптимального налогового режима за 3 клика.\n"
+        "• **Быстрые расчеты в чате (`/calc`):** мгновенный расчет налога УСН 6% с вычетом взносов ИП, маржинальности товара и точки безубыточности.\n"
+        "• **Поиск по ключевым словам и ИИ-ответы:** напишите слово (`ИП`, `налоги`, `взносы`, `касса`, `маркетплейс`) или свой вопрос.\n"
+        "• **Напоминания (`/reminders` и `/demo_push`):** уведомления по конкретным налогам и тест за 10 секунд.\n\n"
         "👇 **Выберите нужный раздел:**",
         reply_markup=kb,
         parse_mode="Markdown"
@@ -620,6 +1087,21 @@ async def cmd_start(message: Message):
     track_msg(message.chat.id, message.message_id)
     await clear_user_chat(message.chat.id, message.message_id)
     await send_start_screen(message, message.from_user.id)
+
+@dp.message(Command("route"))
+async def cmd_route(message: Message):
+    track_msg(message.chat.id, message.message_id)
+    await send_learning_route_screen(message, message.from_user.id)
+
+@dp.message(Command("tax_quiz"))
+async def cmd_tax_quiz(message: Message):
+    track_msg(message.chat.id, message.message_id)
+    await send_tax_quiz_start(message, message.from_user.id)
+
+@dp.message(Command("calc"))
+async def cmd_calc(message: Message):
+    track_msg(message.chat.id, message.message_id)
+    await send_calc_menu_screen(message, message.from_user.id)
 
 @dp.message(Command("ip"))
 async def cmd_ip(message: Message):
@@ -636,7 +1118,7 @@ async def cmd_help(message: Message):
     track_msg(message.chat.id, message.message_id)
     await send_help_screen(message, message.from_user.id)
 
-# --- ОБРАБОТЧИКИ INLINE-КНОПОК ---
+# --- ОБРАБОТЧИКИ INLINE-КНОПОК НАВИГАЦИИ ---
 @dp.callback_query(F.data.startswith("nav_"))
 async def cb_navigation(call: CallbackQuery):
     target = call.data.replace("nav_", "")
@@ -645,6 +1127,12 @@ async def cb_navigation(call: CallbackQuery):
         await send_start_screen(call.message, uid)
     elif target == "ip_hub":
         await send_ip_hub_screen(call.message, uid)
+    elif target == "route":
+        await send_learning_route_screen(call.message, uid)
+    elif target == "tax_quiz":
+        await send_tax_quiz_start(call.message, uid)
+    elif target == "calc":
+        await send_calc_menu_screen(call.message, uid)
     elif target == "tax_reminders":
         await send_tax_reminders_menu(call.message, uid)
     elif target == "profile":
@@ -836,7 +1324,6 @@ async def show_reminders(event: Message | CallbackQuery):
         msg = event.message
 
     with sqlite3.connect(DB_PATH) as conn:
-        # Проверяем, создавались ли вообще напоминания для пользователя ранее
         total_cur = conn.execute("SELECT COUNT(*) FROM reminders WHERE user_id = ?", (user_id,))
         total_count = total_cur.fetchone()[0]
 
@@ -850,7 +1337,6 @@ async def show_reminders(event: Message | CallbackQuery):
                 (user_id, f"Проверка сроков уплаты налога ({u['tax_regime']})", "weekly")
             )
 
-        # Выбираем ТОЛЬКО активные напоминания (отключенные не показываем)
         cur = conn.execute(
             "SELECT id, title, frequency FROM reminders WHERE user_id = ? AND active = 1 AND frequency != 'off'",
             (user_id,)
@@ -902,7 +1388,6 @@ async def cb_change_freq(call: CallbackQuery):
         conn.execute("UPDATE reminders SET frequency = ?, active = ? WHERE id = ?", (new_freq, active, int(rem_id)))
 
     if new_freq == "off":
-        # Удаляем карточку отключенного напоминания из чата
         try:
             await call.message.delete()
         except Exception:
@@ -918,7 +1403,7 @@ async def cb_change_freq(call: CallbackQuery):
     )
     await call.answer("Частота обновлена!")
 
-# --- ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ И ПОИСКА ПО КЛЮЧЕВЫМ СЛОВАМ ---
+# --- ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ, КАЛЬКУЛЯТОРОВ И ПОИСКА ---
 @dp.message()
 async def handle_question(message: Message):
     user_id = message.from_user.id
@@ -936,17 +1421,29 @@ async def handle_question(message: Message):
         await send_profile_screen(message, user_id)
         return
 
-    # 2. Автоматическое обогащение профиля
+    # 2. Если пользователь находится в режиме финансового калькулятора и ввел числа
+    if user_id in USER_CALC_MODE:
+        handled = await process_calculation_input(message, user_id, text)
+        if handled:
+            return
+
+    # 3. Автоматическое обогащение профиля
     auto_extract_profile(user_id, text)
     profile = get_user(user_id)
     t_low = text.lower()
 
-    # 3. Если пользователь написал «ИП» - открываем лаконичный хаб по ИП
+    # 4. Быстрые переходы по ключевым командам в тексте
     if t_low in ["ип", "открыть ип", "про ип", "все об ип", "всё об ип"]:
         await send_ip_hub_screen(message, user_id)
         return
+    if any(w in t_low for w in ["калькулятор", "посчитай", "расчет", "расчёт", "тбу", "безубыточност"]):
+        await send_calc_menu_screen(message, user_id)
+        return
+    if any(w in t_low for w in ["маршрут", "мой трек", "изучено", "прогресс"]):
+        await send_learning_route_screen(message, user_id)
+        return
 
-    # 4. Перехват запроса на напоминание о налоге
+    # 5. Перехват запроса на напоминание о налоге
     if any(w in t_low for w in ["напомни", "напоминание", "срок уплаты"]):
         if "налог" in t_low or "взнос" in t_low or "усн" in t_low or "нпд" in t_low or "патент" in t_low:
             await send_tax_reminders_menu(message, user_id)
@@ -965,19 +1462,23 @@ async def handle_question(message: Message):
         )
         return
 
-    # 5. ПОИСК ПО КЛЮЧЕВЫМ СЛОВАМ (без цифр в кнопках)
-    matches = search_by_keyword(text)
+    # 6. ПОИСК ПО КЛЮЧЕВЫМ СЛОВАМ (с учетом изученных материалов)
+    matches = search_by_keyword(text, user_id=user_id)
+    completed = get_completed_materials(user_id)
     if len(matches) >= 2 and len(text.split()) <= 4:
         buttons = []
         lines = [f"🔎 **По запросу «{text}» найдены материалы в «Альфа-Курсе»:**\n"]
         for item in matches[:5]:
+            done_mark = "✅ [Изучено] " if item["id"] in completed else ""
             badge = "🎓 [Платный курс]" if item["is_paid"] else "📖 [Бесплатно]"
-            lines.append(f"• {badge} **{item['title']}**\n_{item['summary']}_\n")
-            buttons.append([InlineKeyboardButton(text=f"📖 {item['title'][:40]}...", callback_data=f"mat_{item['id']}")])
+            lines.append(f"• {done_mark}{badge} **{item['title']}**\n_{item['summary']}_\n")
+            btn_prefix = "✅" if item["id"] in completed else "📖"
+            buttons.append([InlineKeyboardButton(text=f"{btn_prefix} {item['title'][:38]}...", callback_data=f"mat_{item['id']}")])
 
         if any(w in t_low for w in ["налог", "усн", "нпд", "патент", "взнос"]):
+            buttons.append([InlineKeyboardButton(text="⚡ Подобрать налог за 3 сек", callback_data="nav_tax_quiz")])
             buttons.append([InlineKeyboardButton(text="🔔 Напомнить по конкретному налогу", callback_data="nav_tax_reminders")])
-        buttons.append([InlineKeyboardButton(text="🏢 Раздел «Всё об ИП с нуля»", callback_data="nav_ip_hub")])
+        buttons.append([InlineKeyboardButton(text="🗺 Мой маршрут обучения", callback_data="nav_route")])
 
         lines.append("👇 **Выберите подходящий материал кнопкой ниже:**")
         await send_and_track(
@@ -988,7 +1489,7 @@ async def handle_question(message: Message):
         )
         return
 
-    # 6. Обращение к YandexGPT (для развернутых вопросов)
+    # 7. Обращение к YandexGPT (для развернутых вопросов)
     system_prompt = (
         "Ты - ИИ-помощник образовательной платформы «Альфа-Курс» в Telegram.\n"
         f"Профиль предпринимателя: Стадия={profile['stage']}, Налоги={profile['tax_regime']}, Текущий фокус={profile['goal']}.\n"
@@ -1007,24 +1508,24 @@ async def handle_question(message: Message):
         await send_and_track(message, yandex_answer, parse_mode="Markdown")
         return
 
-    # 7. Если найден 1 точный материал - показываем его
+    # 8. Если найден 1 точный материал - показываем его
     if len(matches) == 1:
         await send_material_card(message, user_id, matches[0]["id"])
         return
 
-    # 8. Если точного совпадения нет
+    # 9. Если точного совпадения нет
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚡ Подбор налогового режима за 3 сек", callback_data="nav_tax_quiz")],
+        [InlineKeyboardButton(text="🧮 Быстрые расчеты в чате (УСН, маржа, ТБУ)", callback_data="nav_calc")],
+        [InlineKeyboardButton(text="🗺 Мой маршрут обучения", callback_data="nav_route")],
         [InlineKeyboardButton(text="🏢 Всё об ИП: открытие с нуля и гид", callback_data="nav_ip_hub")],
-        [InlineKeyboardButton(text="📊 Выбор налогового режима", callback_data="mat_mat_ip_taxes")],
-        [InlineKeyboardButton(text="🔔 Напомнить по конкретному налогу", callback_data="nav_tax_reminders")],
-        [InlineKeyboardButton(text="🛍 Выход на маркетплейсы и юнит-экономика", callback_data="mat_mat_mp_paid")],
         [InlineKeyboardButton(text="🏠 В главное меню", callback_data="nav_start")]
     ])
     await send_and_track(
         message,
         f"В базе знаний «Альфа-Курса» нет точного совпадения по запросу «{text}».\n\n"
         "💡 **Попробуйте написать ключевое слово** (например: `ИП`, `налоги`, `взносы`, `касса`, `маркетплейс`) "
-        "или выберите одну из популярных тем ниже:",
+        "или воспользуйтесь интерактивными инструментами ниже:",
         reply_markup=kb,
         parse_mode="Markdown"
     )
