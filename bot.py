@@ -25,12 +25,12 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
-# Состояния ожидания текстового ввода от пользователя
+
 AWAITING_CUSTOM_GOAL = set()
 USER_CALC_MODE: dict[int, str] = {}   # user_id -> 'usn6' | 'margin' | 'bep'
 TAX_QUIZ_STATE: dict[int, dict] = {}  # user_id -> {'income': ..., 'staff': ...}
 
-# Хранилище ID сообщений для очистки чата по команде /start
+
 CHAT_HISTORY_IDS: dict[int, set[int]] = {}
 
 def track_msg(user_id: int, message_id: int):
@@ -55,7 +55,7 @@ async def clear_user_chat(chat_id: int, current_msg_id: int):
     await asyncio.gather(*tasks, return_exceptions=True)
     CHAT_HISTORY_IDS[chat_id] = set()
 
-# --- СПРАВОЧНИКИ ---
+
 STAGE_MAP = {
     "1": "Планирую открыть дело",
     "2": "Действующий микробизнес",
@@ -111,7 +111,7 @@ SPECIFIC_TAX_REMINDERS = {
     }
 }
 
-# --- БАЗА ЗНАНИЙ «АЛЬФА-КУРСА» ---
+
 CATALOG = [
     {
         "id": "mat_ip_start",
@@ -207,7 +207,7 @@ CATALOG = [
     }
 ]
 
-# --- БАЗА ДАННЫХ (Профили, Напоминания, Изученные материалы) ---
+
 DB_PATH = "sputnik.db"
 
 def init_db():
@@ -305,7 +305,7 @@ def build_safe_context() -> str:
             )
     return "\n\n".join(blocks)
 
-# --- ПОИСК ПО КЛЮЧЕВЫМ СЛОВАМ (неизученные выше) ---
+
 def search_by_keyword(query: str, user_id: int | None = None) -> list[dict]:
     q_words = [w.strip(".,!?\"'()") for w in query.lower().split() if len(w.strip(".,!?\"'()")) >= 2]
     if not q_words:
@@ -330,7 +330,7 @@ def get_material_by_id(mat_id: str) -> dict | None:
             return item
     return None
 
-# --- КЛИЕНТ YANDEX GPT ---
+
 async def ask_yandex_gpt(system_prompt: str, user_text: str) -> str | None:
     if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
         return None
@@ -362,7 +362,7 @@ async def ask_yandex_gpt(system_prompt: str, user_text: str) -> str | None:
         logging.error(f"Ошибка при запросе к YandexGPT: {e}")
         return None
 
-# --- АВТОМАТИЧЕСКОЕ ОБНОВЛЕНИЕ ПРОФИЛЯ ---
+
 def auto_extract_profile(user_id: int, text: str):
     t = text.lower()
     if any(w in t for w in ["усн", "упрощенк"]):
@@ -382,7 +382,7 @@ def auto_extract_profile(user_id: int, text: str):
     elif any(w in t for w in ["налог", "взносы", "декларац", "отчетност"]):
         update_user(user_id, "goal", "Налоги, учет и отчетность")
 
-# --- КЛАВИАТУРЫ ---
+
 def start_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Планирую открыть дело", callback_data="stage_1")],
@@ -488,7 +488,7 @@ def reminder_control_kb(rem_id: int):
         [InlineKeyboardButton(text="🔕 Отключить напоминание", callback_data=f"freq_{rem_id}_off")]
     ])
 
-# --- ОСНОВНЫЕ ЭКРАНЫ БОТА ---
+
 async def send_start_screen(msg: Message, user_id: int):
     AWAITING_CUSTOM_GOAL.discard(user_id)
     USER_CALC_MODE.pop(user_id, None)
@@ -571,7 +571,7 @@ async def send_stage_response(msg: Message, user_id: int, stage_code: str):
             parse_mode="Markdown"
         )
 
-# --- 1. МАРШРУТ ОБУЧЕНИЯ И СТАТУС «ИЗУЧЕНО» ---
+
 async def send_learning_route_screen(msg: Message, user_id: int):
     """Показывает персональный маршрут обучения со статусами «Изучено» и следующим шагом."""
     AWAITING_CUSTOM_GOAL.discard(user_id)
@@ -622,7 +622,7 @@ async def send_learning_route_screen(msg: Message, user_id: int):
         parse_mode="Markdown"
     )
 
-# --- 2. КАЛЬКУЛЯТОР НАЛОГОВОГО РЕЖИМА ЗА 3 СЕКУНДЫ ---
+
 async def send_tax_quiz_start(msg: Message, user_id: int):
     """Шаг 1 из 3: выбор годового дохода."""
     AWAITING_CUSTOM_GOAL.discard(user_id)
@@ -740,7 +740,7 @@ async def cb_tax_quiz_result(call: CallbackQuery):
     )
     await call.answer("Режим подобран!")
 
-# --- 3. РАЗДЕЛ С БЫСТРЫМИ РАСЧЕТАМИ ПРЯМО В ЧАТЕ ---
+
 async def send_calc_menu_screen(msg: Message, user_id: int):
     AWAITING_CUSTOM_GOAL.discard(user_id)
     USER_CALC_MODE.pop(user_id, None)
@@ -920,7 +920,7 @@ async def process_calculation_input(msg: Message, user_id: int, text: str, mode_
 
     return False
 
-# --- ЭКРАН «ВСЁ ОБ ИП» И КАРТОЧКИ МАТЕРИАЛОВ ---
+
 async def send_ip_hub_screen(msg: Message, user_id: int):
     """Упрощенный и наглядный раздел «Всё об ИП» со ссылкой на Альфа-Курс."""
     AWAITING_CUSTOM_GOAL.discard(user_id)
@@ -1081,7 +1081,7 @@ async def send_help_screen(msg: Message, user_id: int):
         parse_mode="Markdown"
     )
 
-# --- КОМАНДЫ ---
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     track_msg(message.chat.id, message.message_id)
@@ -1265,7 +1265,7 @@ async def cb_open_material(call: CallbackQuery):
     await send_material_card(call.message, call.from_user.id, mat_id)
     await call.answer()
 
-# --- СИСТЕМА НАПОМИНАНИЙ ---
+
 async def send_scheduled_reminder(user_id: int, text: str):
     # После срабатывания 10-секундного пуша удаляем (отключаем) напоминание о прохождении обучения
     with sqlite3.connect(DB_PATH) as conn:
@@ -1403,7 +1403,7 @@ async def cb_change_freq(call: CallbackQuery):
     )
     await call.answer("Частота обновлена!")
 
-# --- ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ, КАЛЬКУЛЯТОРОВ И ПОИСКА ---
+
 @dp.message()
 async def handle_question(message: Message):
     user_id = message.from_user.id
@@ -1412,7 +1412,7 @@ async def handle_question(message: Message):
     if not text:
         return
 
-    # 1. Если пользователь вводит собственный «Текущий фокус» текстом
+   
     if user_id in AWAITING_CUSTOM_GOAL:
         AWAITING_CUSTOM_GOAL.discard(user_id)
         clean_goal = text[:80].replace("—", "-").replace("–", "-")
@@ -1421,18 +1421,18 @@ async def handle_question(message: Message):
         await send_profile_screen(message, user_id)
         return
 
-    # 2. Если пользователь находится в режиме финансового калькулятора и ввел числа
+  
     if user_id in USER_CALC_MODE:
         handled = await process_calculation_input(message, user_id, text)
         if handled:
             return
 
-    # 3. Автоматическое обогащение профиля
+  
     auto_extract_profile(user_id, text)
     profile = get_user(user_id)
     t_low = text.lower()
 
-    # 4. Быстрые переходы по ключевым командам в тексте
+    
     if t_low in ["ип", "открыть ип", "про ип", "все об ип", "всё об ип"]:
         await send_ip_hub_screen(message, user_id)
         return
@@ -1443,7 +1443,7 @@ async def handle_question(message: Message):
         await send_learning_route_screen(message, user_id)
         return
 
-    # 5. Перехват запроса на напоминание о налоге
+   
     if any(w in t_low for w in ["напомни", "напоминание", "срок уплаты"]):
         if "налог" in t_low or "взнос" in t_low or "усн" in t_low or "нпд" in t_low or "патент" in t_low:
             await send_tax_reminders_menu(message, user_id)
@@ -1462,7 +1462,7 @@ async def handle_question(message: Message):
         )
         return
 
-    # 6. ПОИСК ПО КЛЮЧЕВЫМ СЛОВАМ (с учетом изученных материалов)
+   
     matches = search_by_keyword(text, user_id=user_id)
     completed = get_completed_materials(user_id)
     if len(matches) >= 2 and len(text.split()) <= 4:
@@ -1489,7 +1489,7 @@ async def handle_question(message: Message):
         )
         return
 
-    # 7. Обращение к YandexGPT (для развернутых вопросов)
+    
     system_prompt = (
         "Ты - ИИ-помощник образовательной платформы «Альфа-Курс» в Telegram.\n"
         f"Профиль предпринимателя: Стадия={profile['stage']}, Налоги={profile['tax_regime']}, Текущий фокус={profile['goal']}.\n"
@@ -1508,12 +1508,12 @@ async def handle_question(message: Message):
         await send_and_track(message, yandex_answer, parse_mode="Markdown")
         return
 
-    # 8. Если найден 1 точный материал - показываем его
+    
     if len(matches) == 1:
         await send_material_card(message, user_id, matches[0]["id"])
         return
 
-    # 9. Если точного совпадения нет
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚡ Подбор налогового режима за 3 сек", callback_data="nav_tax_quiz")],
         [InlineKeyboardButton(text="🧮 Быстрые расчеты в чате (УСН, маржа, ТБУ)", callback_data="nav_calc")],
